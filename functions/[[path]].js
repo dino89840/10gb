@@ -1,5 +1,6 @@
 // ======================= Fast Lugyi Storage =======================
 // Cloudflare Pages Functions + R2  (single-file backend + HTML)
+// Premium UI • Folders • Video Seek (Range) • Security hardened
 // ==================================================================
 
 const MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;        // 10 GB total storage
@@ -11,6 +12,18 @@ const LOCK_KEY = "__meta__/loginlock.json";             // login attempt lock
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+// ---- Security headers (applied to HTML pages) ----
+const SECURITY_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+  "Content-Security-Policy":
+    "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; " +
+    "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; " +
+    "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+};
+
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -20,7 +33,7 @@ function json(data, status = 200, extraHeaders = {}) {
 
 function html(body) {
   return new Response(body, {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+    headers: { "Content-Type": "text/html; charset=utf-8", ...SECURITY_HEADERS },
   });
 }
 
@@ -66,16 +79,17 @@ async function isAuthed(request, env) {
   return !!user;
 }
 
-// ---- Metadata index (file list + total bytes + folders) ----
+// ---- Metadata index (file list + folders + total bytes) ----
 async function loadMeta(env) {
   const obj = await env.R2.get(META_KEY);
   if (!obj) return { totalBytes: 0, files: {}, folders: {} };
   try {
     const m = JSON.parse(await obj.text());
-    if (!m.folders) m.folders = {};
+    m.files = m.files || {};
+    m.folders = m.folders || {};
+    m.totalBytes = m.totalBytes || 0;
     return m;
-  }
-  catch { return { totalBytes: 0, files: {}, folders: {} }; }
+  } catch { return { totalBytes: 0, files: {}, folders: {} }; }
 }
 async function saveMeta(env, meta) {
   await env.R2.put(META_KEY, JSON.stringify(meta), {
@@ -150,46 +164,76 @@ async function presignR2Put(env, objectKey, expiresSec = 3600) {
   return `${endpoint}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
-// ---- Range / streaming response helper (video seek support) ----
-function buildObjectResponse(obj, type, name, { inline, range, status } = {}) {
-  const headers = {
-    "Content-Type": type || "application/octet-stream",
-    "Accept-Ranges": "bytes",
-    "Content-Disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(name)}`,
-  };
-  // R2 writeHttpMetadata helps set etag/last-modified etc.
-  if (obj.writeHttpMetadata) {
-    try { obj.writeHttpMetadata(new Headers()); } catch {}
-  }
-  if (obj.httpEtag) headers["ETag"] = obj.httpEtag;
-
-  if (range && obj.range) {
-    const start = obj.range.offset;
-    const end = start + obj.range.length - 1;
-    headers["Content-Range"] = `bytes ${start}-${end}/${obj.size}`;
-    headers["Content-Length"] = String(obj.range.length);
-    return new Response(obj.body, { status: 206, headers });
-  }
-  headers["Content-Length"] = String(obj.size);
-  return new Response(obj.body, { status: status || 200, headers });
-}
-
-// parse "Range: bytes=START-END"
+// ---- Range request parser ----
 function parseRange(rangeHeader, size) {
+  // returns {offset, length, end} or null
   if (!rangeHeader) return null;
   const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
   if (!m) return null;
   let start = m[1] === "" ? null : parseInt(m[1], 10);
   let end = m[2] === "" ? null : parseInt(m[2], 10);
   if (start === null && end === null) return null;
-  if (start === null) { // suffix: last N bytes
+  if (start === null) {
+    // suffix: last N bytes
     start = Math.max(0, size - end);
     end = size - 1;
   } else if (end === null || end >= size) {
     end = size - 1;
   }
-  if (start > end || start >= size) return null;
-  return { offset: start, length: end - start + 1 };
+  if (start > end || start >= size) return "invalid";
+  return { offset: start, length: end - start + 1, end };
+}
+
+// ---- Stream an R2 object with Range support ----
+async function serveObject(request, env, f, { inlineDefault = false } = {}) {
+  const head = await env.R2.head(f.key);
+  if (!head) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
+  const size = head.size;
+  const ctype = f.type || head.httpMetadata?.contentType || "application/octet-stream";
+  const inline = inlineDefault && /^(image|video|audio|text)\//.test(ctype);
+  const disposition = `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(f.name)}`;
+
+  const rangeHeader = request.headers.get("Range");
+  const range = parseRange(rangeHeader, size);
+
+  if (range === "invalid") {
+    return new Response("Range Not Satisfiable", {
+      status: 416,
+      headers: { "Content-Range": `bytes */${size}`, "Accept-Ranges": "bytes" },
+    });
+  }
+
+  if (range) {
+    const obj = await env.R2.get(f.key, {
+      range: { offset: range.offset, length: range.length },
+    });
+    if (!obj) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
+    return new Response(obj.body, {
+      status: 206,
+      headers: {
+        "Content-Type": ctype,
+        "Content-Length": String(range.length),
+        "Content-Range": `bytes ${range.offset}-${range.end}/${size}`,
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": disposition,
+        "Cache-Control": "public, max-age=3600",
+      },
+    });
+  }
+
+  // Full content
+  const obj = await env.R2.get(f.key);
+  if (!obj) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
+  return new Response(obj.body, {
+    status: 200,
+    headers: {
+      "Content-Type": ctype,
+      "Content-Length": String(size),
+      "Accept-Ranges": "bytes",
+      "Content-Disposition": disposition,
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
 }
 
 // ======================= Main Router =======================
@@ -199,9 +243,9 @@ export async function onRequest(context) {
   const path = url.pathname;
 
   try {
-    // ---------- PUBLIC share viewer page / download (no auth) ----------
+    // ---------- PUBLIC share download (no auth) ----------
     if (path.startsWith("/s/")) {
-      return await handleShare(request, env, path.slice(3), url);
+      return await handleShare(request, env, path.slice(3));
     }
 
     // ---------- Login API ----------
@@ -228,7 +272,7 @@ export async function onRequest(context) {
     }
 
     // ---------- API routes (authed) ----------
-    if (path === "/api/list" && request.method === "GET") return await apiList(env);
+    if (path === "/api/list" && request.method === "GET") return await apiList(request, env);
     if (path === "/api/upload" && request.method === "POST") return await apiUpload(request, env);
     if (path === "/api/presign" && request.method === "POST") return await apiPresign(request, env);
     if (path === "/api/finalize" && request.method === "POST") return await apiFinalize(request, env);
@@ -237,9 +281,11 @@ export async function onRequest(context) {
     if (path === "/api/share" && request.method === "POST") return await apiShare(request, env);
     if (path === "/api/changepass" && request.method === "POST") return await apiChangePass(request, env);
     if (path === "/api/download" && request.method === "GET") return await apiDownload(request, env);
-    if (path === "/api/move" && request.method === "POST") return await apiMove(request, env);
+    // folder routes
     if (path === "/api/folder/create" && request.method === "POST") return await apiFolderCreate(request, env);
     if (path === "/api/folder/delete" && request.method === "POST") return await apiFolderDelete(request, env);
+    if (path === "/api/folder/rename" && request.method === "POST") return await apiFolderRename(request, env);
+    if (path === "/api/move" && request.method === "POST") return await apiMove(request, env);
 
     // ---------- Main page ----------
     if (path === "/" || path === "/index.html") return html(APP_HTML);
@@ -279,7 +325,7 @@ async function handleLogin(request, env) {
 
   rec.fails = (rec.fails || 0) + 1;
   if (rec.fails >= 3) {
-    rec.until = Date.now() + 5 * 60 * 1000;
+    rec.until = Date.now() + 5 * 60 * 1000; // 5 minutes
     rec.fails = 0;
   }
   lock[ip] = rec;
@@ -292,28 +338,52 @@ async function handleLogin(request, env) {
   }, 401);
 }
 
-async function apiList(env) {
+async function apiList(request, env) {
   const meta = await loadMeta(env);
-  const files = Object.entries(meta.files || {}).map(([id, f]) => ({
-    id,
-    name: f.name,
-    size: f.size,
-    type: f.type,
-    folder: f.folder || "",
-    uploadedAt: f.uploadedAt,
-    share: f.share ? {
-      token: f.share.token,
-      expiresAt: f.share.expiresAt,
-    } : null,
-  })).sort((a, b) => (b.uploadedAt || "").localeCompare(a.uploadedAt || ""));
+  const url = new URL(request.url);
+  const folder = url.searchParams.get("folder") || ""; // "" = root
 
-  const folders = Object.entries(meta.folders || {}).map(([id, fo]) => ({
-    id, name: fo.name, createdAt: fo.createdAt,
-  })).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const files = Object.entries(meta.files || {})
+    .filter(([, f]) => (f.folder || "") === folder)
+    .map(([id, f]) => ({
+      id,
+      name: f.name,
+      size: f.size,
+      type: f.type,
+      uploadedAt: f.uploadedAt,
+      folder: f.folder || "",
+      share: f.share ? {
+        token: f.share.token,
+        expiresAt: f.share.expiresAt,
+      } : null,
+    }))
+    .sort((a, b) => (b.uploadedAt || "").localeCompare(a.uploadedAt || ""));
+
+  // folders living under current folder
+  const folders = Object.entries(meta.folders || {})
+    .filter(([, fd]) => (fd.parent || "") === folder)
+    .map(([id, fd]) => {
+      const fileCount = Object.values(meta.files || {}).filter(f => (f.folder || "") === id).length;
+      const subCount = Object.values(meta.folders || {}).filter(s => (s.parent || "") === id).length;
+      return { id, name: fd.name, parent: fd.parent || "", count: fileCount + subCount };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  // breadcrumb path
+  const breadcrumb = [];
+  let cur = folder;
+  const guard = new Set();
+  while (cur && meta.folders[cur] && !guard.has(cur)) {
+    guard.add(cur);
+    breadcrumb.unshift({ id: cur, name: meta.folders[cur].name });
+    cur = meta.folders[cur].parent || "";
+  }
 
   return json({
     files,
     folders,
+    breadcrumb,
+    currentFolder: folder,
     totalBytes: meta.totalBytes || 0,
     maxBytes: MAX_TOTAL_BYTES,
   });
@@ -326,6 +396,7 @@ async function apiUpload(request, env) {
   const file = form.get("file");
   const folder = (form.get("folder") || "").toString();
   if (!file || typeof file === "string") return json({ error: "ဖိုင်မပါပါ" }, 400);
+  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
   const size = file.size;
   if ((meta.totalBytes || 0) + size > MAX_TOTAL_BYTES) {
@@ -344,7 +415,7 @@ async function apiUpload(request, env) {
     size,
     type: file.type || "application/octet-stream",
     uploadedAt: nowMM(),
-    folder: folder && meta.folders?.[folder] ? folder : "",
+    folder,
     key,
   };
   meta.totalBytes = (meta.totalBytes || 0) + size;
@@ -352,13 +423,15 @@ async function apiUpload(request, env) {
   return json({ ok: true, id });
 }
 
-// --- Large file: presigned PUT url ---
+// --- Large file: get presigned PUT url (server enforces 10GB) ---
 async function apiPresign(request, env) {
   const meta = await loadMeta(env);
   const body = await request.json().catch(() => ({}));
-  const { name, size, type } = body;
+  const { name, size, type, folder } = body;
   if (!name || !size) return json({ error: "name/size မပါပါ" }, 400);
+  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
+  // server-side enforcement: cannot upload past 10GB even via direct R2 PUT
   if ((meta.totalBytes || 0) + Number(size) > MAX_TOTAL_BYTES) {
     return json({ error: "Storage 10GB ပြည့်သွားပါပြီ။ တင်၍မရပါ။" }, 413);
   }
@@ -369,19 +442,22 @@ async function apiPresign(request, env) {
   return json({ ok: true, id, key, uploadUrl });
 }
 
-// --- Finalize after presigned upload ---
+// --- After browser uploaded to R2 via presigned url, record metadata ---
 async function apiFinalize(request, env) {
   const meta = await loadMeta(env);
   const body = await request.json().catch(() => ({}));
   const { id, key, name, size, type, folder } = body;
   if (!id || !key) return json({ error: "id/key မပါပါ" }, 400);
+  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
+  // verify object exists & get real size (cannot be spoofed by client)
   const head = await env.R2.head(key);
   if (!head) return json({ error: "R2 ထဲတွင် ဖိုင်မတွေ့ပါ" }, 400);
   const realSize = head.size;
 
+  // server-side enforcement against fake size / over-limit smuggling
   if ((meta.totalBytes || 0) + realSize > MAX_TOTAL_BYTES) {
-    await env.R2.delete(key);
+    await env.R2.delete(key); // rollback
     return json({ error: "Storage 10GB ကျော်သွားသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
   }
 
@@ -391,7 +467,7 @@ async function apiFinalize(request, env) {
     size: realSize,
     type: type || head.httpMetadata?.contentType || "application/octet-stream",
     uploadedAt: nowMM(),
-    folder: folder && meta.folders?.[folder] ? folder : "",
+    folder: folder || "",
     key,
   };
   meta.totalBytes = (meta.totalBytes || 0) + realSize;
@@ -399,17 +475,24 @@ async function apiFinalize(request, env) {
   return json({ ok: true, id });
 }
 
-// --- Remote URL upload with PROGRESS streaming, max 1.5GB ---
+// --- Remote URL upload (stream into R2), max 1.5GB + 10GB total ---
 async function apiRemote(request, env) {
   const meta = await loadMeta(env);
   const body = await request.json().catch(() => ({}));
   const { url: remoteUrl, name, folder } = body;
   if (!remoteUrl) return json({ error: "URL မပါပါ" }, 400);
+  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
+
+  // basic SSRF guard: only http/https, block internal hosts
+  let parsed;
+  try { parsed = new URL(remoteUrl); } catch { return json({ error: "URL မှားနေပါသည်" }, 400); }
+  if (!/^https?:$/.test(parsed.protocol)) return json({ error: "http/https သာ ခွင့်ပြုသည်" }, 400);
+  if (/^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0)/.test(parsed.hostname)) {
+    return json({ error: "ဤ URL ကို ခွင့်မပြုပါ" }, 400);
+  }
 
   const resp = await fetch(remoteUrl);
-  if (!resp.ok || !resp.body) {
-    return json({ error: "URL မှ ဖိုင်ဆွဲ၍မရပါ (" + resp.status + ")" }, 400);
-  }
+  if (!resp.ok) return json({ error: "URL မှ ဖိုင်ဆွဲ၍မရပါ (" + resp.status + ")" }, 400);
 
   const lenHeader = resp.headers.get("Content-Length");
   const declared = lenHeader ? Number(lenHeader) : 0;
@@ -425,117 +508,31 @@ async function apiRemote(request, env) {
   const key = `files/${id}`;
   const ctype = resp.headers.get("Content-Type") || "application/octet-stream";
 
+  await env.R2.put(key, resp.body, { httpMetadata: { contentType: ctype } });
+
+  const head = await env.R2.head(key);
+  const realSize = head ? head.size : declared;
+
+  if (realSize > MAX_REMOTE_BYTES) {
+    await env.R2.delete(key);
+    return json({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
+  }
+  if ((meta.totalBytes || 0) + realSize > MAX_TOTAL_BYTES) {
+    await env.R2.delete(key);
+    return json({ error: "Storage 10GB ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
+  }
+
   let fname = name;
   if (!fname) {
     try { fname = decodeURIComponent(new URL(remoteUrl).pathname.split("/").pop()) || id; }
     catch { fname = id; }
   }
-  const safeFolder = folder && meta.folders?.[folder] ? folder : "";
 
-  // We stream the response: as we pump bytes from remote -> R2, we ALSO
-  // emit progress JSON lines back to the browser (NDJSON).
-  let downloaded = 0;
-  let aborted = false;
-
-  // Tee approach: we read remote body, count bytes, build a TransformStream
-  // that R2.put consumes, while we push progress events out.
-  const progressStream = new ReadableStream({
-    async start(controller) {
-      const emit = (o) => controller.enqueue(enc.encode(JSON.stringify(o) + "\n"));
-      try {
-        const reader = resp.body.getReader();
-
-        // Build a stream for R2 that mirrors the bytes we read
-        let r2Resolve, r2Reject;
-        const r2Done = new Promise((res, rej) => { r2Resolve = res; r2Reject = rej; });
-
-        const r2Source = new ReadableStream({
-          async pull(r2ctrl) {
-            try {
-              const { done, value } = await reader.read();
-              if (done) {
-                r2ctrl.close();
-                return;
-              }
-              downloaded += value.byteLength;
-
-              if (downloaded > MAX_REMOTE_BYTES) {
-                aborted = true;
-                r2ctrl.error(new Error("limit"));
-                return;
-              }
-              r2ctrl.enqueue(value);
-            } catch (e) {
-              r2ctrl.error(e);
-            }
-          }
-        });
-
-        // Start R2 upload in parallel
-        const putPromise = env.R2.put(key, r2Source, {
-          httpMetadata: { contentType: ctype },
-        }).then(() => r2Resolve()).catch((e) => r2Reject(e));
-
-        // Emit progress periodically while uploading
-        const ticker = setInterval(() => {
-          const pct = declared ? Math.min(99, Math.floor(downloaded / declared * 100)) : null;
-          emit({ progress: true, downloaded, total: declared || null, pct });
-        }, 500);
-
-        try {
-          await putPromise;
-        } finally {
-          clearInterval(ticker);
-        }
-
-        if (aborted) {
-          await env.R2.delete(key).catch(() => {});
-          emit({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။" });
-          controller.close();
-          return;
-        }
-
-        // verify final size
-        const head = await env.R2.head(key);
-        const realSize = head ? head.size : downloaded;
-
-        if (realSize > MAX_REMOTE_BYTES) {
-          await env.R2.delete(key).catch(() => {});
-          emit({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။" });
-          controller.close();
-          return;
-        }
-        if ((meta.totalBytes || 0) + realSize > MAX_TOTAL_BYTES) {
-          await env.R2.delete(key).catch(() => {});
-          emit({ error: "Storage 10GB ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။" });
-          controller.close();
-          return;
-        }
-
-        // save metadata (reload to avoid stale)
-        const meta2 = await loadMeta(env);
-        meta2.files = meta2.files || {};
-        meta2.files[id] = { name: fname, size: realSize, type: ctype, uploadedAt: nowMM(), folder: safeFolder, key };
-        meta2.totalBytes = (meta2.totalBytes || 0) + realSize;
-        await saveMeta(env, meta2);
-
-        emit({ done: true, id, pct: 100, downloaded: realSize, total: realSize });
-        controller.close();
-      } catch (e) {
-        await env.R2.delete(key).catch(() => {});
-        try { controller.enqueue(enc.encode(JSON.stringify({ error: String(e && e.message || e) }) + "\n")); } catch {}
-        controller.close();
-      }
-    }
-  });
-
-  return new Response(progressStream, {
-    headers: {
-      "Content-Type": "application/x-ndjson; charset=utf-8",
-      "Cache-Control": "no-store",
-      "X-Accel-Buffering": "no",
-    },
-  });
+  meta.files = meta.files || {};
+  meta.files[id] = { name: fname, size: realSize, type: ctype, uploadedAt: nowMM(), folder: folder || "", key };
+  meta.totalBytes = (meta.totalBytes || 0) + realSize;
+  await saveMeta(env, meta);
+  return json({ ok: true, id });
 }
 
 async function apiDelete(request, env) {
@@ -552,52 +549,7 @@ async function apiDelete(request, env) {
   return json({ ok: true });
 }
 
-// --- Folder create ---
-async function apiFolderCreate(request, env) {
-  const meta = await loadMeta(env);
-  const body = await request.json().catch(() => ({}));
-  const name = (body.name || "").toString().trim();
-  if (!name) return json({ error: "Folder နာမည်ထည့်ပါ" }, 400);
-  meta.folders = meta.folders || {};
-  // duplicate name check
-  for (const fo of Object.values(meta.folders)) {
-    if (fo.name === name) return json({ error: "ဒီနာမည်နဲ့ folder ရှိနှင့်ပြီးသား" }, 400);
-  }
-  const id = randId();
-  meta.folders[id] = { name, createdAt: nowMM() };
-  await saveMeta(env, meta);
-  return json({ ok: true, id });
-}
-
-// --- Folder delete (files inside move to root, not deleted) ---
-async function apiFolderDelete(request, env) {
-  const meta = await loadMeta(env);
-  const body = await request.json().catch(() => ({}));
-  const { id } = body;
-  if (!meta.folders?.[id]) return json({ error: "Folder မတွေ့ပါ" }, 404);
-  // move files inside to root
-  for (const f of Object.values(meta.files || {})) {
-    if (f.folder === id) f.folder = "";
-  }
-  delete meta.folders[id];
-  await saveMeta(env, meta);
-  return json({ ok: true });
-}
-
-// --- Move file into folder (or root) ---
-async function apiMove(request, env) {
-  const meta = await loadMeta(env);
-  const body = await request.json().catch(() => ({}));
-  const { id, folder } = body;
-  const f = meta.files?.[id];
-  if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
-  if (folder && !meta.folders?.[folder]) return json({ error: "Folder မတွေ့ပါ" }, 404);
-  f.folder = folder || "";
-  await saveMeta(env, meta);
-  return json({ ok: true });
-}
-
-// --- Create / update share link ---
+// --- Create / update share link with duration ---
 async function apiShare(request, env) {
   const meta = await loadMeta(env);
   const body = await request.json().catch(() => ({}));
@@ -642,42 +594,22 @@ async function apiChangePass(request, env) {
   return json({ ok: true });
 }
 
-// --- Authed download (supports Range for video seek) ---
+// --- Authed download (original file) — WITH RANGE/SEEK SUPPORT ---
 async function apiDownload(request, env) {
   const url = new URL(request.url);
   const id = url.searchParams.get("id");
-  const inlineParam = url.searchParams.get("inline") === "1";
   const meta = await loadMeta(env);
   const f = meta.files?.[id];
   if (!f) return new Response("Not Found", { status: 404 });
-
-  const rangeHeader = request.headers.get("Range");
-  if (rangeHeader) {
-    const head = await env.R2.head(f.key);
-    if (!head) return new Response("Not Found", { status: 404 });
-    const r = parseRange(rangeHeader, head.size);
-    if (r) {
-      const obj = await env.R2.get(f.key, { range: { offset: r.offset, length: r.length } });
-      if (!obj) return new Response("Not Found", { status: 404 });
-      obj.size = head.size; // ensure size available
-      return buildObjectResponse(obj, f.type, f.name, { inline: inlineParam, range: true });
-    }
-  }
-
-  const obj = await env.R2.get(f.key);
-  if (!obj) return new Response("Not Found", { status: 404 });
-  return buildObjectResponse(obj, f.type, f.name, { inline: inlineParam });
+  // inlineDefault=false -> download as attachment, but range still supported
+  return await serveObject(request, env, f, { inlineDefault: false });
 }
 
-// --- Public share: viewer page OR raw download (with Range support) ---
-async function handleShare(request, env, rest, url) {
-  // rest could be "TOKEN" or "TOKEN/raw"
-  const isRaw = rest.endsWith("/raw");
-  const token = isRaw ? rest.slice(0, -4) : rest;
-
+// --- Public share download (no auth, checks expiry) — WITH RANGE/SEEK SUPPORT ---
+async function handleShare(request, env, token) {
   const meta = await loadMeta(env);
   let target = null;
-  for (const f of Object.values(meta.files || {})) {
+  for (const [, f] of Object.entries(meta.files || {})) {
     if (f.share && f.share.token === token) { target = f; break; }
   }
   if (!target) return new Response("Link မတွေ့ပါ", { status: 404 });
@@ -686,113 +618,92 @@ async function handleShare(request, env, rest, url) {
     return new Response("ဤ link သက်တမ်းကုန်သွားပါပြီ။ (မူရင်းဖိုင်မပျက်ပါ)", { status: 410 });
   }
 
-  const isMedia = /^(image|video|audio)\//.test(target.type || "");
+  // inlineDefault=true -> video/audio/image plays inline & supports seeking
+  return await serveObject(request, env, target, { inlineDefault: true });
+}
 
-  // If not raw and it's a media file -> show a viewer page (user clicks Play)
-  if (!isRaw && isMedia) {
-    return html(buildViewerHTML(target, token));
-  }
-  if (!isRaw && /^text\//.test(target.type || "")) {
-    // for text, also show viewer with a "view/download" choice
-    return html(buildViewerHTML(target, token));
-  }
+// ======================= Folder Handlers =======================
+async function apiFolderCreate(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  let { name, parent } = body;
+  name = (name || "").toString().trim();
+  parent = (parent || "").toString();
+  if (!name) return json({ error: "Folder နာမည် ထည့်ပါ" }, 400);
+  if (name.length > 80) return json({ error: "နာမည် ရှည်လွန်းနေပါသည်" }, 400);
+  if (parent && !meta.folders[parent]) return json({ error: "Parent folder မတွေ့ပါ" }, 400);
 
-  // raw (or non-media): serve the bytes, support Range
-  const rawUrl = `/s/${token}/raw`;
-  const rangeHeader = request.headers.get("Range");
-  const inline = isMedia || /^text\//.test(target.type || "");
+  // duplicate name in same parent?
+  const dup = Object.values(meta.folders).some(
+    fd => (fd.parent || "") === parent && fd.name.toLowerCase() === name.toLowerCase()
+  );
+  if (dup) return json({ error: "ဤနာမည်ဖြင့် folder ရှိပြီးသားပါ" }, 400);
 
-  if (rangeHeader) {
-    const head = await env.R2.head(target.key);
-    if (!head) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
-    const r = parseRange(rangeHeader, head.size);
-    if (r) {
-      const obj = await env.R2.get(target.key, { range: { offset: r.offset, length: r.length } });
-      if (!obj) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
-      obj.size = head.size;
-      const res = buildObjectResponse(obj, target.type, target.name, { inline, range: true });
-      res.headers.set("Cache-Control", "public, max-age=3600");
-      return res;
+  const id = randId();
+  meta.folders[id] = { name, parent, createdAt: nowMM() };
+  await saveMeta(env, meta);
+  return json({ ok: true, id });
+}
+
+async function apiFolderRename(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  let { id, name } = body;
+  name = (name || "").toString().trim();
+  const fd = meta.folders?.[id];
+  if (!fd) return json({ error: "Folder မတွေ့ပါ" }, 404);
+  if (!name) return json({ error: "နာမည် ထည့်ပါ" }, 400);
+  fd.name = name;
+  await saveMeta(env, meta);
+  return json({ ok: true });
+}
+
+// Delete folder (and everything inside it recursively)
+async function apiFolderDelete(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  const { id } = body;
+  if (!meta.folders?.[id]) return json({ error: "Folder မတွေ့ပါ" }, 404);
+
+  // collect this folder + all descendants
+  const toDelete = new Set([id]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [fid, fd] of Object.entries(meta.folders)) {
+      if (!toDelete.has(fid) && toDelete.has(fd.parent || "")) {
+        toDelete.add(fid);
+        changed = true;
+      }
     }
   }
 
-  const obj = await env.R2.get(target.key);
-  if (!obj) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
-  const res = buildObjectResponse(obj, target.type, target.name, { inline });
-  res.headers.set("Cache-Control", "public, max-age=3600");
-  return res;
+  // delete files inside those folders
+  for (const [fileId, f] of Object.entries(meta.files)) {
+    if (toDelete.has(f.folder || "")) {
+      await env.R2.delete(f.key);
+      meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
+      delete meta.files[fileId];
+    }
+  }
+  // delete folder entries
+  for (const fid of toDelete) delete meta.folders[fid];
+
+  await saveMeta(env, meta);
+  return json({ ok: true });
 }
 
-// ======================= Viewer page (user clicks to play) =======================
-function buildViewerHTML(file, token) {
-  const raw = `/s/${token}/raw`;
-  const type = file.type || "";
-  const name = file.name || "file";
-  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-  let playerInit = "";
-  if (/^video\//.test(type)) {
-    playerInit = `
-      function play(){
-        const box=document.getElementById('box');
-        box.innerHTML='<video controls autoplay playsinline style="width:100%;max-height:80vh;border-radius:12px;background:#000"><source src="${raw}" type="${esc(type)}"></video>';
-      }`;
-  } else if (/^audio\//.test(type)) {
-    playerInit = `
-      function play(){
-        const box=document.getElementById('box');
-        box.innerHTML='<audio controls autoplay style="width:100%"><source src="${raw}" type="${esc(type)}"></audio>';
-      }`;
-  } else if (/^image\//.test(type)) {
-    playerInit = `
-      function play(){
-        const box=document.getElementById('box');
-        box.innerHTML='<img src="${raw}" style="max-width:100%;max-height:80vh;border-radius:12px">';
-      }`;
-  } else {
-    playerInit = `
-      function play(){
-        const box=document.getElementById('box');
-        box.innerHTML='<iframe src="${raw}" style="width:100%;height:70vh;border:0;border-radius:12px;background:#fff"></iframe>';
-      }`;
-  }
-
-  const kind = /^video\//.test(type) ? "Video" :
-               /^audio\//.test(type) ? "Audio" :
-               /^image\//.test(type) ? "Image" : "File";
-  const icon = /^video\//.test(type) ? "🎬" :
-               /^audio\//.test(type) ? "🎵" :
-               /^image\//.test(type) ? "🖼" : "📄";
-
-  return `<!DOCTYPE html>
-<html lang="my"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(name)}</title>
-<style>
-*{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
-body{margin:0;min-height:100vh;background:linear-gradient(135deg,#1e3c72,#2a5298);
-display:flex;align-items:center;justify-content:center;padding:16px}
-.card{background:#fff;border-radius:16px;padding:20px;max-width:760px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.3)}
-h1{font-size:18px;margin:0 0 4px;color:#1e3c72;word-break:break-all}
-.meta{color:#888;font-size:13px;margin-bottom:14px}
-#box{min-height:120px;display:flex;align-items:center;justify-content:center}
-.playbtn{background:#1e3c72;color:#fff;border:0;border-radius:12px;padding:18px 26px;font-size:16px;cursor:pointer}
-.playbtn:hover{background:#2a5298}
-.dl{display:inline-block;margin-top:14px;color:#1e3c72;text-decoration:none;font-size:14px;border:1px solid #1e3c72;padding:8px 14px;border-radius:8px}
-.center{text-align:center}
-</style></head><body>
-<div class="card">
-<h1>${icon} ${esc(name)}</h1>
-<div class="meta">${kind} • ${esc(type)}</div>
-<div id="box" class="center">
-  <button class="playbtn" onclick="play()">▶ ဖွင့်ကြည့်ရန် (Play)</button>
-</div>
-<div class="center">
-  <a class="dl" href="${raw}" download>⬇ Download</a>
-</div>
-</div>
-<script>${playerInit}</script>
-</body></html>`;
+// Move a file into another folder ("" = root)
+async function apiMove(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  const { id, folder } = body;
+  const f = meta.files?.[id];
+  if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
+  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
+  f.folder = folder || "";
+  await saveMeta(env, meta);
+  return json({ ok: true });
 }
 
 // ======================= HTML PAGES =======================
@@ -800,38 +711,61 @@ h1{font-size:18px;margin:0 0 4px;color:#1e3c72;word-break:break-all}
 const LOGIN_HTML = `<!DOCTYPE html>
 <html lang="my"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fast Lugyi Storage - ဝင်ရန်</title>
+<title>Fast Lugyi Storage • ဝင်ရန်</title>
 <style>
+:root{--brand1:#6d28d9;--brand2:#2563eb;--accent:#06b6d4}
 *{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-background:linear-gradient(135deg,#1e3c72,#2a5298);padding:16px}
-.card{background:#fff;padding:32px;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.3);width:100%;max-width:380px}
-h1{margin:0 0 4px;font-size:22px;color:#1e3c72;text-align:center}
-.sub{text-align:center;color:#888;font-size:13px;margin-bottom:20px}
-input{width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:8px;font-size:15px}
-button{width:100%;padding:12px;margin-top:8px;background:#1e3c72;color:#fff;border:0;border-radius:8px;font-size:16px;cursor:pointer}
-button:hover{background:#2a5298}
-.err{color:#d33;font-size:13px;margin-top:8px;text-align:center;min-height:18px}
+background:linear-gradient(135deg,#0f172a,#1e1b4b 45%,#312e81);padding:16px;overflow:hidden;position:relative}
+body::before,body::after{content:"";position:absolute;border-radius:50%;filter:blur(80px);opacity:.55;z-index:0}
+body::before{width:340px;height:340px;background:#7c3aed;top:-80px;left:-60px}
+body::after{width:300px;height:300px;background:#06b6d4;bottom:-70px;right:-50px}
+.card{position:relative;z-index:1;background:rgba(255,255,255,.08);backdrop-filter:blur(18px);
+border:1px solid rgba(255,255,255,.18);padding:36px 30px;border-radius:22px;
+box-shadow:0 20px 60px rgba(0,0,0,.45);width:100%;max-width:390px;color:#fff}
+.logo{width:64px;height:64px;margin:0 auto 14px;border-radius:18px;display:flex;align-items:center;justify-content:center;
+background:linear-gradient(135deg,var(--brand1),var(--accent));box-shadow:0 8px 24px rgba(109,40,217,.5);font-size:30px}
+h1{margin:0 0 4px;font-size:23px;text-align:center;font-weight:700;
+background:linear-gradient(90deg,#c4b5fd,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{text-align:center;color:rgba(255,255,255,.65);font-size:13px;margin-bottom:22px}
+.field{position:relative;margin:12px 0}
+.field input{width:100%;padding:13px 14px 13px 42px;border:1px solid rgba(255,255,255,.2);
+border-radius:12px;font-size:15px;background:rgba(255,255,255,.07);color:#fff;outline:none;transition:.2s}
+.field input::placeholder{color:rgba(255,255,255,.5)}
+.field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(6,182,212,.25)}
+.field .ic{position:absolute;left:14px;top:50%;transform:translateY(-50%);opacity:.7}
+button{width:100%;padding:13px;margin-top:10px;border:0;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;color:#fff;
+background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 8px 22px rgba(37,99,235,.45);transition:.2s}
+button:hover{transform:translateY(-1px);box-shadow:0 12px 28px rgba(37,99,235,.55)}
+button:disabled{opacity:.6;cursor:not-allowed}
+.err{color:#fca5a5;font-size:13px;margin-top:10px;text-align:center;min-height:18px}
+.foot{text-align:center;margin-top:16px;font-size:11px;color:rgba(255,255,255,.45)}
 </style></head><body>
 <div class="card">
-<h1>⚡ Fast Lugyi Storage</h1>
-<div class="sub">အကောင့်ဝင်ရန်</div>
-<input id="u" placeholder="Username" autocomplete="username">
-<input id="p" type="password" placeholder="Password" autocomplete="current-password">
-<button id="btn" onclick="login()">ဝင်မည်</button>
+<div class="logo">⚡</div>
+<h1>Fast Lugyi Storage</h1>
+<div class="sub">🔒 လုံခြုံစိတ်ချရသော Cloud သိုလှောင်မှု</div>
+<div class="field"><span class="ic">👤</span><input id="u" placeholder="Username" autocomplete="username"></div>
+<div class="field"><span class="ic">🔑</span><input id="p" type="password" placeholder="Password" autocomplete="current-password"></div>
+<button id="btn" onclick="login()">🚀 ဝင်မည်</button>
 <div class="err" id="err"></div>
+<div class="foot">Powered by Cloudflare R2 • Premium Edition</div>
 </div>
 <script>
 async function login(){
-  const btn=document.getElementById('btn');btn.disabled=true;btn.textContent='ဝင်နေသည်...';
+  const btn=document.getElementById('btn');btn.disabled=true;btn.textContent='⏳ ဝင်နေသည်...';
   document.getElementById('err').textContent='';
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({username:u.value,password:p.value})});
-  const d=await r.json();
-  if(r.ok){location.href='/';}
-  else{document.getElementById('err').textContent=d.error||'ဝင်၍မရပါ';btn.disabled=false;btn.textContent='ဝင်မည်';}
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:u.value,password:p.value})});
+    const d=await r.json();
+    if(r.ok){location.href='/';return;}
+    document.getElementById('err').textContent=d.error||'ဝင်၍မရပါ';
+  }catch(e){document.getElementById('err').textContent='ကွန်ရက် ပြဿနာ';}
+  btn.disabled=false;btn.textContent='🚀 ဝင်မည်';
 }
 document.getElementById('p').addEventListener('keydown',e=>{if(e.key==='Enter')login();});
+document.getElementById('u').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('p').focus();});
 </script>
 </body></html>`;
 
@@ -840,93 +774,113 @@ const APP_HTML = `<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fast Lugyi Storage</title>
 <style>
+:root{--brand1:#6d28d9;--brand2:#2563eb;--accent:#06b6d4;--bg:#0f172a;--card:#ffffff;--ink:#1e293b;--muted:#64748b}
 *{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
-body{margin:0;background:#f0f2f5;color:#222}
-header{background:linear-gradient(135deg,#1e3c72,#2a5298);color:#fff;padding:16px;display:flex;
-align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
-header h1{margin:0;font-size:20px}
-.wrap{max-width:900px;margin:0 auto;padding:16px}
-.bar{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-.prog{height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden;margin-top:8px}
-.prog>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#16a34a,#22c55e);transition:width .3s}
+body{margin:0;background:linear-gradient(180deg,#eef2ff,#f8fafc);color:var(--ink);min-height:100vh}
+header{background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;padding:16px 18px;
+display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
+box-shadow:0 6px 24px rgba(37,99,235,.35);position:sticky;top:0;z-index:20}
+.brand{display:flex;align-items:center;gap:10px}
+.brand .lg{width:40px;height:40px;border-radius:12px;background:rgba(255,255,255,.18);
+display:flex;align-items:center;justify-content:center;font-size:22px;backdrop-filter:blur(8px)}
+header h1{margin:0;font-size:19px;font-weight:700}
+.wrap{max-width:960px;margin:0 auto;padding:18px}
+.bar{background:var(--card);border-radius:16px;padding:18px;margin-bottom:16px;
+box-shadow:0 4px 18px rgba(15,23,42,.07);border:1px solid #eef0f5}
+.bar b{font-size:15px}
+.prog{height:12px;background:#e5e7eb;border-radius:8px;overflow:hidden;margin-top:10px}
+.prog>i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#06b6d4);transition:width .5s}
 .prog.warn>i{background:linear-gradient(90deg,#f59e0b,#ef4444)}
-button{padding:9px 14px;border:0;border-radius:8px;background:#1e3c72;color:#fff;cursor:pointer;font-size:14px}
-button:hover{opacity:.9}
-button.sec{background:#e5e7eb;color:#333}
-button.danger{background:#ef4444}
-input,select{padding:9px;border:1px solid #ddd;border-radius:8px;font-size:14px}
+button{padding:10px 15px;border:0;border-radius:10px;color:#fff;cursor:pointer;font-size:14px;font-weight:600;transition:.18s;
+background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 4px 12px rgba(37,99,235,.3)}
+button:hover{transform:translateY(-1px)}
+button.sec{background:#eef2f7;color:#334155;box-shadow:none}
+button.sec:hover{background:#e2e8f0}
+button.danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
+button.ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.4);box-shadow:none}
+input,select{padding:10px;border:1px solid #d8dde6;border-radius:10px;font-size:14px;background:#fff;outline:none}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(6,182,212,.18)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
-.file{background:#fff;border-radius:12px;padding:12px;margin-bottom:10px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-.file .top{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
+.sec-title{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px}
+.crumb{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:14px;margin-bottom:12px}
+.crumb a{color:var(--brand2);cursor:pointer;text-decoration:none;font-weight:600}
+.crumb span.sep{color:#94a3b8}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.fold{background:linear-gradient(135deg,#fff,#f5f7ff);border:1px solid #e4e8f5;border-radius:14px;padding:14px;cursor:pointer;
+display:flex;flex-direction:column;gap:6px;transition:.18s;position:relative}
+.fold:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(37,99,235,.15);border-color:#c7d2fe}
+.fold .ico{font-size:30px}
+.fold .nm{font-weight:600;word-break:break-word}
+.fold .ct{font-size:12px;color:var(--muted)}
+.fold .x{position:absolute;top:8px;right:8px;border:0;background:#fee2e2;color:#b91c1c;border-radius:8px;
+width:26px;height:26px;font-size:13px;padding:0;box-shadow:none;display:none}
+.fold:hover .x{display:block}
+.file{background:var(--card);border-radius:14px;padding:14px;margin-bottom:10px;
+box-shadow:0 3px 14px rgba(15,23,42,.06);border:1px solid #eef0f5;transition:.18s}
+.file:hover{box-shadow:0 8px 22px rgba(15,23,42,.1)}
+.file .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.ficon{font-size:26px;flex-shrink:0}
 .fname{font-weight:600;word-break:break-all}
-.meta{font-size:12px;color:#888;margin-top:4px}
-.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
-.acts button{font-size:13px;padding:6px 10px}
-.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;background:#dbeafe;color:#1e40af;margin-left:6px}
+.meta{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
+.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+.acts button{font-size:13px;padding:7px 11px}
+.tag{display:inline-block;font-size:11px;padding:2px 9px;border-radius:10px;background:#dbeafe;color:#1e40af;margin-left:6px;font-weight:600}
 .tag.exp{background:#fee2e2;color:#991b1b}
-.folderbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-.fchip{padding:7px 12px;border-radius:20px;background:#fff;border:1px solid #ddd;cursor:pointer;font-size:13px}
-.fchip.active{background:#1e3c72;color:#fff;border-color:#1e3c72}
-.miniprog{height:8px;background:#e5e7eb;border-radius:6px;overflow:hidden;margin-top:6px;display:none}
-.miniprog>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#16a34a,#22c55e);transition:width .2s}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#222;color:#fff;
-padding:12px 20px;border-radius:8px;z-index:99;opacity:0;transition:.3s;font-size:14px;max-width:90%}
-.toast.show{opacity:1}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
+.tag.life{background:#dcfce7;color:#166534}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;
+padding:13px 22px;border-radius:12px;z-index:99;opacity:0;transition:.3s;font-size:14px;max-width:90%;box-shadow:0 8px 26px rgba(0,0,0,.4)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(-4px)}
+.modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(4px);display:none;
+align-items:center;justify-content:center;z-index:50;padding:16px}
 .modal.show{display:flex}
-.modal .box{background:#fff;border-radius:12px;padding:20px;max-width:380px;width:100%}
-.modal h3{margin:0 0 12px}
+.modal .box{background:#fff;border-radius:18px;padding:24px;max-width:400px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.modal h3{margin:0 0 14px;font-size:18px}
 .modal input,.modal select{width:100%;margin:6px 0}
-small{color:#888}
+small{color:var(--muted)}
+.empty{text-align:center;color:var(--muted);padding:40px 0}
+.empty .big{font-size:46px}
 </style></head><body>
 <header>
-<h1>⚡ Fast Lugyi Storage</h1>
+<div class="brand"><div class="lg">⚡</div><h1>Fast Lugyi Storage</h1></div>
 <div class="row" style="margin:0">
-<button class="sec" onclick="openPass()">Password ပြောင်း</button>
-<button class="sec" onclick="logout()">ထွက်မည်</button>
+<button class="ghost" onclick="openPass()">🔑 Password</button>
+<button class="ghost" onclick="logout()">🚪 ထွက်မည်</button>
 </div>
 </header>
 <div class="wrap">
 
 <div class="bar">
-<b>Storage အသုံးပြုမှု</b>
-<div id="usage">တွက်နေသည်...</div>
-<div class="prog" id="progWrap"><i id="progBar"></i></div>
+<b>💾 Storage အသုံးပြုမှု</b>
+<div id="usage" style="margin-top:6px;font-size:14px">တွက်နေသည်...</div>
+<div class="prog" id="progWrap"><i id="progBar" style="width:0%"></i></div>
 </div>
 
 <div class="bar">
-<b>📤 ဖုန်းထဲကဖိုင်တင်ရန် (Photo / Video / Txt / Music ...)</b>
-<div class="row">
-<input type="file" id="fileInput" multiple>
-<select id="uploadFolder"><option value="">📁 Root (folder မထည့်)</option></select>
-<button onclick="uploadLocal()">တင်မည်</button>
+<div class="sec-title">📤 ဖိုင်တင်ရန် (Photo / Video / Txt / Music ...)</div>
+<div class="row" style="margin-top:10px">
+<input type="file" id="fileInput" multiple style="flex:1;min-width:200px">
+<button onclick="uploadLocal()">⬆ တင်မည်</button>
+<button class="sec" onclick="openNewFolder()">📁 Folder အသစ်</button>
 </div>
 <div id="upStatus"><small></small></div>
 </div>
 
 <div class="bar">
-<b>🔗 Remote URL ဖြင့်တင်ရန် (1.5GB ထိ)</b>
-<div class="row">
+<div class="sec-title">🔗 Remote URL ဖြင့်တင်ရန် <small>(1.5GB ထိ)</small></div>
+<div class="row" style="margin-top:10px">
 <input type="text" id="remoteUrl" placeholder="https://..." style="flex:1;min-width:180px">
 <input type="text" id="remoteName" placeholder="ဖိုင်နာမည် (optional)">
-<select id="remoteFolder"><option value="">📁 Root</option></select>
-<button id="remoteBtn" onclick="uploadRemote()">တင်မည်</button>
+<button onclick="uploadRemote()">⬆ တင်မည်</button>
 </div>
-<div class="miniprog" id="remoteProgWrap"><i id="remoteProgBar"></i></div>
 <div id="remoteStatus"><small></small></div>
 </div>
 
-<div class="bar">
-<b>📁 Folder များ</b>
-<div class="row">
-<input type="text" id="newFolderName" placeholder="folder နာမည်အသစ်">
-<button onclick="createFolder()">+ Folder ဆောက်မည်</button>
-</div>
-</div>
+<div class="crumb" id="crumb"></div>
 
-<div class="folderbar" id="folderBar"></div>
+<div class="sec-title" style="margin-bottom:10px">📂 Folders</div>
+<div class="grid" id="folders"></div>
 
-<h3 id="listTitle">📁 ဖိုင်များ</h3>
+<div class="sec-title" style="margin-bottom:10px">📁 ဖိုင်များ</div>
 <div id="list"></div>
 
 </div>
@@ -934,24 +888,33 @@ small{color:#888}
 <!-- Share modal -->
 <div class="modal" id="shareModal"><div class="box">
 <h3>🔗 Share Link</h3>
-<select id="shareDur" style="width:100%;margin-bottom:10px">
-<option value="2d">၂ ရက်</option>
-<option value="1w">၁ ပတ်</option>
-<option value="1m">၁ လ</option>
-<option value="1y">၁ နှစ်</option>
-<option value="lifetime">Lifetime (သက်တမ်းမကုန်)</option>
-<option value="off">Link ပိတ်မည်</option>
+<select id="shareDur">
+<option value="2d">📅 ၂ ရက်</option>
+<option value="1w">📅 ၁ ပတ်</option>
+<option value="1m">📅 ၁ လ</option>
+<option value="1y">📅 ၁ နှစ်</option>
+<option value="lifetime">♾️ Lifetime (သက်တမ်းမကုန်)</option>
+<option value="off">🚫 Link ပိတ်မည်</option>
 </select>
-<button onclick="doShare()" style="width:100%">အတည်ပြုမည်</button>
+<button onclick="doShare()" style="width:100%;margin-top:10px">✅ အတည်ပြုမည်</button>
 <div id="shareResult" style="margin-top:12px;word-break:break-all;font-size:13px"></div>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('shareModal')">ပိတ်မည်</button>
 </div></div>
 
+<!-- New folder modal -->
+<div class="modal" id="folderModal"><div class="box">
+<h3>📁 Folder အသစ်ဆောက်ရန်</h3>
+<input type="text" id="folderName" placeholder="Folder နာမည်" maxlength="80">
+<button onclick="doCreateFolder()" style="width:100%;margin-top:8px">✅ ဆောက်မည်</button>
+<div id="folderErr" style="color:#d33;font-size:13px;margin-top:8px"></div>
+<button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('folderModal')">ပိတ်မည်</button>
+</div></div>
+
 <!-- Move modal -->
 <div class="modal" id="moveModal"><div class="box">
-<h3>📂 Folder သို့ ရွှေ့ရန်</h3>
-<select id="moveFolder" style="width:100%;margin-bottom:10px"></select>
-<button onclick="doMove()" style="width:100%">ရွှေ့မည်</button>
+<h3>📦 ဖိုင်ရွှေ့ရန်</h3>
+<select id="moveTarget"></select>
+<button onclick="doMove()" style="width:100%;margin-top:10px">✅ ရွှေ့မည်</button>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('moveModal')">ပိတ်မည်</button>
 </div></div>
 
@@ -960,7 +923,7 @@ small{color:#888}
 <h3>🔑 Password ပြောင်းရန်</h3>
 <input type="password" id="oldPass" placeholder="လက်ရှိ password">
 <input type="password" id="newPass" placeholder="password အသစ်">
-<button onclick="doChangePass()" style="width:100%;margin-top:8px">ပြောင်းမည်</button>
+<button onclick="doChangePass()" style="width:100%;margin-top:8px">✅ ပြောင်းမည်</button>
 <div id="passErr" style="color:#d33;font-size:13px;margin-top:8px"></div>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('passModal')">ပိတ်မည်</button>
 </div></div>
@@ -968,10 +931,10 @@ small{color:#888}
 <div class="toast" id="toast"></div>
 
 <script>
+let currentFolder="";          // "" = root
 let currentShareId=null;
 let currentMoveId=null;
-let currentFolder="";   // active filter folder id ("" = root view = all root files)
-let DATA={files:[],folders:[]};
+let allFolders=[];             // for move dropdown
 
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
 setTimeout(()=>t.classList.remove('show'),3000);}
@@ -979,80 +942,72 @@ function fmtSize(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed
 if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB';}
 function openModal(id){document.getElementById(id).classList.add('show');}
 function closeModal(id){document.getElementById(id).classList.remove('show');}
+function fileIcon(t){t=t||'';if(t.startsWith('video/'))return'🎬';if(t.startsWith('image/'))return'🖼️';
+if(t.startsWith('audio/'))return'🎵';if(t.startsWith('text/'))return'📄';
+if(t.includes('pdf'))return'📕';if(t.includes('zip')||t.includes('rar'))return'🗜️';return'📦';}
 
 async function load(){
-  const r=await fetch('/api/list');
+  const r=await fetch('/api/list?folder='+encodeURIComponent(currentFolder));
   if(r.status===401){location.href='/login';return;}
   const d=await r.json();
-  DATA=d;
+
   // usage
   const pct=Math.min(100,(d.totalBytes/d.maxBytes*100)).toFixed(1);
   document.getElementById('usage').innerHTML=
-    fmtSize(d.totalBytes)+' / '+fmtSize(d.maxBytes)+' ('+pct+'%)';
-  const bar=document.getElementById('progBar');bar.style.width=pct+'%';
+    '<b>'+fmtSize(d.totalBytes)+'</b> / '+fmtSize(d.maxBytes)+' &nbsp;<span style="color:#64748b">('+pct+'%)</span>';
+  document.getElementById('progBar').style.width=pct+'%';
   document.getElementById('progWrap').className='prog'+(pct>85?' warn':'');
 
-  renderFolderSelects();
-  renderFolderBar();
-  renderList();
-}
+  // breadcrumb
+  let cb='<a onclick="goFolder(\\'\\')">🏠 Home</a>';
+  for(const b of d.breadcrumb){
+    cb+='<span class="sep">›</span><a onclick="goFolder(\\''+b.id+'\\')">'+escapeHtml(b.name)+'</a>';
+  }
+  document.getElementById('crumb').innerHTML=cb;
 
-function renderFolderSelects(){
-  const opts='<option value="">📁 Root</option>'+
-    DATA.folders.map(fo=>'<option value="'+fo.id+'">📁 '+escapeHtml(fo.name)+'</option>').join('');
-  document.getElementById('uploadFolder').innerHTML='<option value="">📁 Root (folder မထည့်)</option>'+
-    DATA.folders.map(fo=>'<option value="'+fo.id+'">📁 '+escapeHtml(fo.name)+'</option>').join('');
-  document.getElementById('remoteFolder').innerHTML=opts;
-  document.getElementById('moveFolder').innerHTML=opts;
-}
+  // folders grid
+  const fg=document.getElementById('folders');
+  if(!d.folders.length){fg.innerHTML='<div style="color:#94a3b8;font-size:13px">Folder မရှိသေးပါ။</div>';}
+  else{
+    fg.innerHTML=d.folders.map(fd=>
+      '<div class="fold" onclick="goFolder(\\''+fd.id+'\\')">'+
+      '<button class="x" title="ဖျက်မည်" onclick="event.stopPropagation();delFolder(\\''+fd.id+'\\',\\''+escapeJs(fd.name)+'\\')">🗑</button>'+
+      '<div class="ico">📁</div><div class="nm">'+escapeHtml(fd.name)+'</div>'+
+      '<div class="ct">'+fd.count+' items</div></div>'
+    ).join('');
+  }
 
-function renderFolderBar(){
-  const bar=document.getElementById('folderBar');
-  let h='<div class="fchip'+(currentFolder===''?' active':'')+'" onclick="setFolder(\\'\\')">📂 အားလုံး</div>';
-  h+=DATA.folders.map(fo=>{
-    const count=DATA.files.filter(f=>f.folder===fo.id).length;
-    return '<div class="fchip'+(currentFolder===fo.id?' active':'')+'" onclick="setFolder(\\''+fo.id+'\\')">📁 '+
-      escapeHtml(fo.name)+' ('+count+') <span onclick="event.stopPropagation();delFolder(\\''+fo.id+'\\',\\''+escapeJs(fo.name)+'\\')" style="margin-left:6px;color:#ef4444">✕</span></div>';
-  }).join('');
-  bar.innerHTML=h;
-}
-
-function setFolder(id){currentFolder=id;renderFolderBar();renderList();
-  const title=document.getElementById('listTitle');
-  if(id===''){title.textContent='📁 ဖိုင်အားလုံး';}
-  else{const fo=DATA.folders.find(x=>x.id===id);title.textContent='📁 '+(fo?fo.name:'');}
-}
-
-function renderList(){
+  // files
   const list=document.getElementById('list');
-  let files=DATA.files;
-  if(currentFolder!==''){files=files.filter(f=>f.folder===currentFolder);}
-  if(!files.length){list.innerHTML='<p style="color:#888">ဖိုင်မရှိသေးပါ။</p>';return;}
-  list.innerHTML=files.map(f=>{
-    let shareTag='';
-    if(f.share){
-      const exp=f.share.expiresAt;
-      if(exp&&Date.now()>exp) shareTag='<span class="tag exp">Link ကုန်</span>';
-      else if(exp) shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
-      else shareTag='<span class="tag">Lifetime</span>';
-    }
-    const folderName=f.folder?(DATA.folders.find(x=>x.id===f.folder)||{}).name:'';
-    const folderTag=folderName?'<span class="tag" style="background:#fef3c7;color:#92400e">📁 '+escapeHtml(folderName)+'</span>':'';
-    return '<div class="file"><div class="top"><div>'+
-      '<div class="fname">'+escapeHtml(f.name)+shareTag+folderTag+'</div>'+
-      '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type)+'<br>📅 '+f.uploadedAt+' (မြန်မာစံတော်ချိန်)</div>'+
-      '</div></div><div class="acts">'+
-      '<button onclick="dl(\\''+f.id+'\\')">⬇ Download</button>'+
-      (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\')">📋 Link Copy</button>':'')+
-      '<button class="sec" onclick="openShare(\\''+f.id+'\\')">🔗 Share</button>'+
-      '<button class="sec" onclick="openMove(\\''+f.id+'\\',\\''+(f.folder||'')+'\\')">📂 ရွှေ့</button>'+
-      '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+escapeJs(f.name)+'\\')">🗑 ဖျက်</button>'+
-      '</div></div>';
-  }).join('');
+  if(!d.files.length){
+    list.innerHTML='<div class="empty"><div class="big">🗂️</div>ဤနေရာတွင် ဖိုင်မရှိသေးပါ။</div>';
+  }else{
+    list.innerHTML=d.files.map(f=>{
+      let shareTag='';
+      if(f.share){
+        const exp=f.share.expiresAt;
+        if(exp&&Date.now()>exp) shareTag='<span class="tag exp">Link ကုန်</span>';
+        else if(exp) shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
+        else shareTag='<span class="tag life">♾️ Lifetime</span>';
+      }
+      return '<div class="file"><div class="top">'+
+        '<div style="display:flex;gap:10px"><div class="ficon">'+fileIcon(f.type)+'</div><div>'+
+        '<div class="fname">'+escapeHtml(f.name)+shareTag+'</div>'+
+        '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type)+'<br>🕒 '+f.uploadedAt+' (မြန်မာစံတော်ချိန်)</div>'+
+        '</div></div></div><div class="acts">'+
+        '<button onclick="dl(\\''+f.id+'\\')">⬇ Download</button>'+
+        (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\')">📋 Link</button>':'')+
+        '<button class="sec" onclick="openShare(\\''+f.id+'\\')">🔗 Share</button>'+
+        '<button class="sec" onclick="openMove(\\''+f.id+'\\')">📦 ရွှေ့</button>'+
+        '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+escapeJs(f.name)+'\\')">🗑 ဖျက်</button>'+
+        '</div></div>';
+    }).join('');
+  }
 }
-
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function escapeJs(s){return String(s).replace(/['\\\\]/g,'\\\\$&').replace(/"/g,'&quot;');}
+
+function goFolder(id){currentFolder=id;load();}
 
 function dl(id){window.open('/api/download?id='+encodeURIComponent(id),'_blank');}
 
@@ -1060,125 +1015,113 @@ async function del(id,name){
   if(!confirm('"'+name+'" ကို အပြီးဖျက်မှာ သေချာလား?'))return;
   const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
   const d=await r.json();
-  if(r.ok){toast('ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မဖျက်နိုင်ပါ');
+  if(r.ok){toast('🗑 ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မဖျက်နိုင်ပါ');
 }
 
-// ---- Folder ops ----
-async function createFolder(){
-  const name=document.getElementById('newFolderName').value.trim();
-  if(!name){toast('Folder နာမည်ထည့်ပါ');return;}
-  const r=await fetch('/api/folder/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+// ---- Folders ----
+function openNewFolder(){document.getElementById('folderErr').textContent='';
+  document.getElementById('folderName').value='';openModal('folderModal');}
+async function doCreateFolder(){
+  const name=document.getElementById('folderName').value.trim();
+  if(!name){document.getElementById('folderErr').textContent='နာမည်ထည့်ပါ';return;}
+  const r=await fetch('/api/folder/create',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,parent:currentFolder})});
   const d=await r.json();
-  if(r.ok){toast('Folder ဆောက်ပြီးပါပြီ');document.getElementById('newFolderName').value='';load();}
-  else toast(d.error||'မရပါ');
+  if(r.ok){toast('📁 Folder ဆောက်ပြီးပါပြီ');closeModal('folderModal');load();}
+  else document.getElementById('folderErr').textContent=d.error||'မရပါ';
 }
 async function delFolder(id,name){
-  if(!confirm('"'+name+'" folder ကို ဖျက်မှာလား? (ထဲကဖိုင်တွေ Root သို့ ပြန်ရွှေ့ပါမည်၊ ဖိုင်မပျက်ပါ)'))return;
+  if(!confirm('"'+name+'" folder နှင့် အထဲက ဖိုင်အားလုံးကို ဖျက်မှာ သေချာလား?'))return;
   const r=await fetch('/api/folder/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
   const d=await r.json();
-  if(r.ok){toast('Folder ဖျက်ပြီးပါပြီ');if(currentFolder===id)currentFolder='';load();}
-  else toast(d.error||'မရပါ');
+  if(r.ok){toast('🗑 Folder ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မရပါ');
 }
 
-function openMove(id,cur){currentMoveId=id;document.getElementById('moveFolder').value=cur||'';openModal('moveModal');}
+// ---- Move ----
+async function openMove(id){
+  currentMoveId=id;
+  // fetch full folder list (all)
+  const r=await fetch('/api/list?folder=');
+  // gather all folders by walking — simpler: use a dedicated traversal via repeated calls is heavy,
+  // so we just offer root + folders visible from list endpoint recursively isn't available;
+  // we request a flat list through breadcrumb-less approach:
+  await buildAllFolders();
+  const sel=document.getElementById('moveTarget');
+  sel.innerHTML='<option value="">🏠 Home (root)</option>'+
+    allFolders.map(f=>'<option value="'+f.id+'">📁 '+escapeHtml(f.path)+'</option>').join('');
+  openModal('moveModal');
+}
+async function buildAllFolders(){
+  // BFS through folders using list endpoint
+  allFolders=[];
+  const visited=new Set();
+  async function walk(folderId,prefix){
+    const r=await fetch('/api/list?folder='+encodeURIComponent(folderId));
+    const d=await r.json();
+    for(const fd of d.folders){
+      const p=prefix?prefix+' / '+fd.name:fd.name;
+      allFolders.push({id:fd.id,path:p});
+      if(!visited.has(fd.id)){visited.add(fd.id);await walk(fd.id,p);}
+    }
+  }
+  await walk("","");
+}
 async function doMove(){
-  const folder=document.getElementById('moveFolder').value;
-  const r=await fetch('/api/move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentMoveId,folder})});
+  const folder=document.getElementById('moveTarget').value;
+  const r=await fetch('/api/move',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:currentMoveId,folder})});
   const d=await r.json();
-  if(r.ok){toast('ရွှေ့ပြီးပါပြီ');closeModal('moveModal');load();}
+  if(r.ok){toast('📦 ရွှေ့ပြီးပါပြီ');closeModal('moveModal');load();}
   else toast(d.error||'မရပါ');
 }
 
-// ---- Local upload ----
+// ---- Local upload: small files (<90MB) direct; large via presign ----
 const DIRECT_LIMIT=90*1024*1024;
 async function uploadLocal(){
   const inp=document.getElementById('fileInput');
-  const folder=document.getElementById('uploadFolder').value;
   const files=[...inp.files];
   if(!files.length){toast('ဖိုင်ရွေးပါ');return;}
   const st=document.getElementById('upStatus').querySelector('small');
   for(const file of files){
-    st.textContent=file.name+' တင်နေသည်...';
+    st.textContent='⏳ '+file.name+' တင်နေသည်...';
     try{
       if(file.size<=DIRECT_LIMIT){
-        const fd=new FormData();fd.append('file',file);fd.append('folder',folder);
+        const fd=new FormData();fd.append('file',file);fd.append('folder',currentFolder);
         const r=await fetch('/api/upload',{method:'POST',body:fd});
         const d=await r.json();
         if(!r.ok)throw new Error(d.error);
       }else{
         const pr=await fetch('/api/presign',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({name:file.name,size:file.size,type:file.type})});
+          body:JSON.stringify({name:file.name,size:file.size,type:file.type,folder:currentFolder})});
         const pd=await pr.json();
         if(!pr.ok)throw new Error(pd.error);
-        st.textContent=file.name+' (ကြီးမားသောဖိုင်) R2 သို့ တိုက်ရိုက်တင်နေသည်...';
+        st.textContent='⏳ '+file.name+' (ကြီးမားသောဖိုင်) R2 သို့ တိုက်ရိုက်တင်နေသည်...';
         const put=await fetch(pd.uploadUrl,{method:'PUT',body:file,headers:{'Content-Type':file.type||'application/octet-stream'}});
         if(!put.ok)throw new Error('R2 PUT failed '+put.status);
         const fr=await fetch('/api/finalize',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({id:pd.id,key:pd.key,name:file.name,size:file.size,type:file.type,folder})});
+          body:JSON.stringify({id:pd.id,key:pd.key,name:file.name,size:file.size,type:file.type,folder:currentFolder})});
         const fd2=await fr.json();
         if(!fr.ok)throw new Error(fd2.error);
       }
-      toast(file.name+' တင်ပြီးပါပြီ');
+      toast('✅ '+file.name+' တင်ပြီးပါပြီ');
     }catch(e){toast('❌ '+file.name+': '+e.message);st.textContent='';return;}
   }
   st.textContent='';inp.value='';load();
 }
 
-// ---- Remote upload WITH progress (reads NDJSON stream) ----
 async function uploadRemote(){
   const url=document.getElementById('remoteUrl').value.trim();
   const name=document.getElementById('remoteName').value.trim();
-  const folder=document.getElementById('remoteFolder').value;
   if(!url){toast('URL ထည့်ပါ');return;}
-  const btn=document.getElementById('remoteBtn');
   const st=document.getElementById('remoteStatus').querySelector('small');
-  const pwrap=document.getElementById('remoteProgWrap');
-  const pbar=document.getElementById('remoteProgBar');
-  btn.disabled=true;
-  pwrap.style.display='block';pbar.style.width='0%';
-  st.textContent='Remote ဖိုင်တင်နေသည်... (ခဏစောင့်ပါ)';
-
-  try{
-    const r=await fetch('/api/remote',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url,name,folder})});
-    if(!r.ok && r.headers.get('Content-Type')?.includes('json')){
-      const d=await r.json();throw new Error(d.error||'မတင်နိုင်ပါ');
-    }
-    // read NDJSON stream
-    const reader=r.body.getReader();
-    const decoder=new TextDecoder();
-    let buf='';
-    let finished=false;
-    while(true){
-      const {done,value}=await reader.read();
-      if(done)break;
-      buf+=decoder.decode(value,{stream:true});
-      let idx;
-      while((idx=buf.indexOf('\\n'))>=0){
-        const line=buf.slice(0,idx).trim();buf=buf.slice(idx+1);
-        if(!line)continue;
-        let ev;try{ev=JSON.parse(line);}catch{continue;}
-        if(ev.error){throw new Error(ev.error);}
-        if(ev.progress){
-          if(ev.pct!=null){pbar.style.width=ev.pct+'%';st.textContent='တင်နေသည်... '+ev.pct+'% ('+fmtSize(ev.downloaded)+')';}
-          else{st.textContent='တင်နေသည်... '+fmtSize(ev.downloaded)+' (အရွယ်အစား မသိ)';}
-        }
-        if(ev.done){pbar.style.width='100%';st.textContent='✅ ပြီးပါပြီ ('+fmtSize(ev.downloaded)+')';finished=true;}
-      }
-    }
-    if(!finished){/* stream ended without done */}
-    toast('Remote ဖိုင်တင်ပြီးပါပြီ');
-    document.getElementById('remoteUrl').value='';
-    document.getElementById('remoteName').value='';
-    setTimeout(()=>{pwrap.style.display='none';st.textContent='';},1500);
-    load();
-  }catch(e){
-    toast('❌ '+(e.message||'မတင်နိုင်ပါ'));
-    st.textContent='❌ '+(e.message||'မတင်နိုင်ပါ');
-    pwrap.style.display='none';
-  }finally{
-    btn.disabled=false;
-  }
+  st.textContent='⏳ Remote ဖိုင်တင်နေသည်... (ခဏစောင့်ပါ)';
+  const r=await fetch('/api/remote',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url,name,folder:currentFolder})});
+  const d=await r.json();
+  st.textContent='';
+  if(r.ok){toast('✅ Remote ဖိုင်တင်ပြီးပါပြီ');document.getElementById('remoteUrl').value='';
+    document.getElementById('remoteName').value='';load();}
+  else toast('❌ '+(d.error||'မတင်နိုင်ပါ'));
 }
 
 function openShare(id){currentShareId=id;document.getElementById('shareResult').textContent='';openModal('shareModal');}
@@ -1190,10 +1133,10 @@ async function doShare(){
   if(!r.ok){toast(d.error||'မရပါ');return;}
   if(d.share){
     const link=location.origin+'/s/'+d.share.token;
-    document.getElementById('shareResult').innerHTML='<b>Link:</b><br>'+link+
+    document.getElementById('shareResult').innerHTML='<b>🔗 Link:</b><br>'+link+
       '<br><button style="margin-top:8px" onclick="copyText(\\''+link+'\\')">📋 Copy</button>';
-    toast('Share link ဖန်တီးပြီးပါပြီ');
-  }else{document.getElementById('shareResult').textContent='Link ပိတ်လိုက်ပါပြီ။';toast('Link ပိတ်ပြီး');}
+    toast('✅ Share link ဖန်တီးပြီးပါပြီ');
+  }else{document.getElementById('shareResult').textContent='🚫 Link ပိတ်လိုက်ပါပြီ။';toast('Link ပိတ်ပြီး');}
   load();
 }
 function copyShare(token){copyText(location.origin+'/s/'+token);}
@@ -1207,7 +1150,7 @@ async function doChangePass(){
   const r=await fetch('/api/changepass',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({oldPass,newPass})});
   const d=await r.json();
-  if(r.ok){toast('Password ပြောင်းပြီးပါပြီ');closeModal('passModal');}
+  if(r.ok){toast('✅ Password ပြောင်းပြီးပါပြီ');closeModal('passModal');}
   else document.getElementById('passErr').textContent=d.error||'မရပါ';
 }
 
