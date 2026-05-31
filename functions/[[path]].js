@@ -6,6 +6,7 @@ const MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;        // 10 GB total storage
 const MAX_REMOTE_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024); // 1.5 GB remote url
 const META_KEY = "__meta__/index.json";                 // file list + total size
 const LOCK_KEY = "__meta__/loginlock.json";             // login attempt lock
+const PROG_PREFIX = "__meta__/progress/";               // remote upload progress
 
 // ---------- Helpers ----------
 const enc = new TextEncoder();
@@ -66,12 +67,16 @@ async function isAuthed(request, env) {
   return !!user;
 }
 
-// ---- Metadata index (file list + total bytes) ----
+// ---- Metadata index (file list + total bytes + folders) ----
 async function loadMeta(env) {
   const obj = await env.R2.get(META_KEY);
-  if (!obj) return { totalBytes: 0, files: {} };
-  try { return JSON.parse(await obj.text()); }
-  catch { return { totalBytes: 0, files: {} }; }
+  if (!obj) return { totalBytes: 0, files: {}, folders: {} };
+  try {
+    const m = JSON.parse(await obj.text());
+    if (!m.folders) m.folders = {};
+    if (!m.files) m.files = {};
+    return m;
+  } catch { return { totalBytes: 0, files: {}, folders: {} }; }
 }
 async function saveMeta(env, meta) {
   await env.R2.put(META_KEY, JSON.stringify(meta), {
@@ -87,6 +92,21 @@ async function loadLock(env) {
 }
 async function saveLock(env, lock) {
   await env.R2.put(LOCK_KEY, JSON.stringify(lock));
+}
+
+// ---- Remote upload progress (separate small objects so polling is cheap) ----
+async function saveProgress(env, pid, data) {
+  await env.R2.put(PROG_PREFIX + pid, JSON.stringify(data), {
+    httpMetadata: { contentType: "application/json" },
+  });
+}
+async function loadProgress(env, pid) {
+  const obj = await env.R2.get(PROG_PREFIX + pid);
+  if (!obj) return null;
+  try { return JSON.parse(await obj.text()); } catch { return null; }
+}
+async function deleteProgress(env, pid) {
+  try { await env.R2.delete(PROG_PREFIX + pid); } catch {}
 }
 
 function nowMM() {
@@ -147,6 +167,68 @@ async function presignR2Put(env, objectKey, expiresSec = 3600) {
   return `${endpoint}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
+// ---- Parse HTTP Range header: "bytes=START-END" ----
+function parseRange(rangeHeader, size) {
+  if (!rangeHeader) return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!m) return null;
+  let start = m[1] === "" ? null : Number(m[1]);
+  let end = m[2] === "" ? null : Number(m[2]);
+
+  if (start === null && end === null) return null;
+
+  if (start === null) {
+    // suffix: last N bytes
+    start = Math.max(0, size - end);
+    end = size - 1;
+  } else if (end === null) {
+    end = size - 1;
+  }
+  if (isNaN(start) || isNaN(end) || start > end || start >= size) return null;
+  end = Math.min(end, size - 1);
+  return { start, end };
+}
+
+// ---- Serve an R2 object with Range support (for video seek, etc.) ----
+async function serveR2Object(request, env, fileMeta, disposition /* "inline"|"attachment" */) {
+  const key = fileMeta.key;
+  const fullSize = fileMeta.size;
+  const ctype = fileMeta.type || "application/octet-stream";
+  const dispName = `${disposition}; filename*=UTF-8''${encodeURIComponent(fileMeta.name)}`;
+
+  const rangeHeader = request.headers.get("Range");
+  const range = parseRange(rangeHeader, fullSize);
+
+  if (range) {
+    const len = range.end - range.start + 1;
+    const obj = await env.R2.get(key, { range: { offset: range.start, length: len } });
+    if (!obj) return new Response("Not Found", { status: 404 });
+    const headers = {
+      "Content-Type": ctype,
+      "Content-Disposition": dispName,
+      "Accept-Ranges": "bytes",
+      "Content-Range": `bytes ${range.start}-${range.end}/${fullSize}`,
+      "Content-Length": String(len),
+      "Cache-Control": "public, max-age=3600",
+    };
+    if (obj.httpEtag) headers["ETag"] = obj.httpEtag;
+    return new Response(obj.body, { status: 206, headers });
+  }
+
+  // Full object
+  const obj = await env.R2.get(key);
+  if (!obj) return new Response("Not Found", { status: 404 });
+  const headers = {
+    "Content-Type": ctype,
+    "Content-Disposition": dispName,
+    "Accept-Ranges": "bytes",
+    "Content-Length": String(fullSize),
+    "Cache-Control": "public, max-age=3600",
+  };
+  if (obj.httpEtag) headers["ETag"] = obj.httpEtag;
+  return new Response(obj.body, { status: 200, headers });
+}
+
 // ======================= Main Router =======================
 export async function onRequest(context) {
   const { request, env } = context;
@@ -188,10 +270,16 @@ export async function onRequest(context) {
     if (path === "/api/presign" && request.method === "POST") return await apiPresign(request, env);
     if (path === "/api/finalize" && request.method === "POST") return await apiFinalize(request, env);
     if (path === "/api/remote" && request.method === "POST") return await apiRemote(request, env);
+    if (path === "/api/remote-progress" && request.method === "GET") return await apiRemoteProgress(request, env);
     if (path === "/api/delete" && request.method === "POST") return await apiDelete(request, env);
     if (path === "/api/share" && request.method === "POST") return await apiShare(request, env);
     if (path === "/api/changepass" && request.method === "POST") return await apiChangePass(request, env);
     if (path === "/api/download" && request.method === "GET") return await apiDownload(request, env);
+    // ---- Folder routes ----
+    if (path === "/api/folder/create" && request.method === "POST") return await apiFolderCreate(request, env);
+    if (path === "/api/folder/delete" && request.method === "POST") return await apiFolderDelete(request, env);
+    if (path === "/api/folder/rename" && request.method === "POST") return await apiFolderRename(request, env);
+    if (path === "/api/move" && request.method === "POST") return await apiMove(request, env);
 
     // ---------- Main page ----------
     if (path === "/" || path === "/index.html") return html(APP_HTML);
@@ -217,7 +305,6 @@ async function handleLogin(request, env) {
   const body = await request.json().catch(() => ({}));
   const { username, password } = body;
 
-  // current password: env.AUTH_PASS, but if user changed it, stored in meta
   const meta = await loadMeta(env);
   const currentPass = meta.password || env.AUTH_PASS;
 
@@ -230,10 +317,9 @@ async function handleLogin(request, env) {
     });
   }
 
-  // failed
   rec.fails = (rec.fails || 0) + 1;
   if (rec.fails >= 3) {
-    rec.until = Date.now() + 5 * 60 * 1000; // 5 minutes
+    rec.until = Date.now() + 5 * 60 * 1000;
     rec.fails = 0;
   }
   lock[ip] = rec;
@@ -254,13 +340,22 @@ async function apiList(env) {
     size: f.size,
     type: f.type,
     uploadedAt: f.uploadedAt,
+    folderId: f.folderId || null,
     share: f.share ? {
       token: f.share.token,
-      expiresAt: f.share.expiresAt, // null = lifetime
+      expiresAt: f.share.expiresAt,
     } : null,
   })).sort((a, b) => (b.uploadedAt || "").localeCompare(a.uploadedAt || ""));
+
+  const folders = Object.entries(meta.folders || {}).map(([id, fo]) => ({
+    id,
+    name: fo.name,
+    createdAt: fo.createdAt,
+  })).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
   return json({
     files,
+    folders,
     totalBytes: meta.totalBytes || 0,
     maxBytes: MAX_TOTAL_BYTES,
   });
@@ -271,7 +366,10 @@ async function apiUpload(request, env) {
   const meta = await loadMeta(env);
   const form = await request.formData();
   const file = form.get("file");
+  const folderId = form.get("folderId") || null;
   if (!file || typeof file === "string") return json({ error: "ဖိုင်မပါပါ" }, 400);
+
+  if (folderId && !meta.folders[folderId]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
   const size = file.size;
   if ((meta.totalBytes || 0) + size > MAX_TOTAL_BYTES) {
@@ -290,6 +388,7 @@ async function apiUpload(request, env) {
     size,
     type: file.type || "application/octet-stream",
     uploadedAt: nowMM(),
+    folderId: folderId || null,
     key,
   };
   meta.totalBytes = (meta.totalBytes || 0) + size;
@@ -318,16 +417,16 @@ async function apiPresign(request, env) {
 async function apiFinalize(request, env) {
   const meta = await loadMeta(env);
   const body = await request.json().catch(() => ({}));
-  const { id, key, name, size, type } = body;
+  const { id, key, name, size, type, folderId } = body;
   if (!id || !key) return json({ error: "id/key မပါပါ" }, 400);
+  if (folderId && !meta.folders[folderId]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
-  // verify object exists & get real size
   const head = await env.R2.head(key);
   if (!head) return json({ error: "R2 ထဲတွင် ဖိုင်မတွေ့ပါ" }, 400);
   const realSize = head.size;
 
   if ((meta.totalBytes || 0) + realSize > MAX_TOTAL_BYTES) {
-    await env.R2.delete(key); // rollback
+    await env.R2.delete(key);
     return json({ error: "Storage 10GB ကျော်သွားသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
   }
 
@@ -337,6 +436,7 @@ async function apiFinalize(request, env) {
     size: realSize,
     type: type || head.httpMetadata?.contentType || "application/octet-stream",
     uploadedAt: nowMM(),
+    folderId: folderId || null,
     key,
   };
   meta.totalBytes = (meta.totalBytes || 0) + realSize;
@@ -344,15 +444,16 @@ async function apiFinalize(request, env) {
   return json({ ok: true, id });
 }
 
-// --- Remote URL upload (stream into R2), max 1.5GB ---
+// --- Remote URL upload (stream into R2 with progress), max 1.5GB ---
 async function apiRemote(request, env) {
   const meta = await loadMeta(env);
   const body = await request.json().catch(() => ({}));
-  const { url: remoteUrl, name } = body;
+  const { url: remoteUrl, name, folderId } = body;
   if (!remoteUrl) return json({ error: "URL မပါပါ" }, 400);
+  if (folderId && !meta.folders[folderId]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
   const resp = await fetch(remoteUrl);
-  if (!resp.ok) return json({ error: "URL မှ ဖိုင်ဆွဲ၍မရပါ (" + resp.status + ")" }, 400);
+  if (!resp.ok || !resp.body) return json({ error: "URL မှ ဖိုင်ဆွဲ၍မရပါ (" + resp.status + ")" }, 400);
 
   const lenHeader = resp.headers.get("Content-Length");
   const declared = lenHeader ? Number(lenHeader) : 0;
@@ -368,22 +469,82 @@ async function apiRemote(request, env) {
   const key = `files/${id}`;
   const ctype = resp.headers.get("Content-Type") || "application/octet-stream";
 
-  await env.R2.put(key, resp.body, { httpMetadata: { contentType: ctype } });
+  // progress id (returned to client so it can poll)
+  const pid = randId();
+  await saveProgress(env, pid, { total: declared, loaded: 0, done: false, error: null, ts: Date.now() });
+
+  // Wrap the remote stream to count bytes + abort if exceeds limits.
+  let loaded = 0;
+  let lastWrite = 0;
+  let aborted = false;
+  const reader = resp.body.getReader();
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) { controller.close(); return; }
+        loaded += value.byteLength;
+
+        if (loaded > MAX_REMOTE_BYTES) {
+          aborted = true;
+          controller.error(new Error("REMOTE_TOO_BIG"));
+          try { await reader.cancel(); } catch {}
+          return;
+        }
+        if ((meta.totalBytes || 0) + loaded > MAX_TOTAL_BYTES) {
+          aborted = true;
+          controller.error(new Error("STORAGE_FULL"));
+          try { await reader.cancel(); } catch {}
+          return;
+        }
+
+        controller.enqueue(value);
+
+        // update progress at most ~every 1MB to avoid too many R2 writes
+        const now = Date.now();
+        if (loaded - lastWrite >= 1024 * 1024 || now - 0 === 0) {
+          lastWrite = loaded;
+          // fire and forget
+          saveProgress(env, pid, {
+            total: declared, loaded, done: false, error: null, ts: now,
+          }).catch(() => {});
+        }
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel() { try { reader.cancel(); } catch {} },
+  });
+
+  try {
+    await env.R2.put(key, stream, { httpMetadata: { contentType: ctype } });
+  } catch (e) {
+    await env.R2.delete(key).catch(() => {});
+    const msg = aborted
+      ? (String(e.message).includes("STORAGE_FULL")
+          ? "Storage 10GB ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။"
+          : "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။")
+      : "Remote ဖိုင်တင်ရာတွင် အမှားဖြစ်ပါသည်။";
+    await saveProgress(env, pid, { total: declared, loaded, done: true, error: msg, ts: Date.now() });
+    return json({ error: msg, pid }, 413);
+  }
 
   const head = await env.R2.head(key);
-  const realSize = head ? head.size : declared;
+  const realSize = head ? head.size : loaded;
 
-  // enforce limits after upload (in case content-length unknown)
   if (realSize > MAX_REMOTE_BYTES) {
     await env.R2.delete(key);
-    return json({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
+    const msg = "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။";
+    await saveProgress(env, pid, { total: declared, loaded, done: true, error: msg, ts: Date.now() });
+    return json({ error: msg, pid }, 413);
   }
   if ((meta.totalBytes || 0) + realSize > MAX_TOTAL_BYTES) {
     await env.R2.delete(key);
-    return json({ error: "Storage 10GB ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
+    const msg = "Storage 10GB ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။";
+    await saveProgress(env, pid, { total: declared, loaded, done: true, error: msg, ts: Date.now() });
+    return json({ error: msg, pid }, 413);
   }
 
-  // derive name
   let fname = name;
   if (!fname) {
     try { fname = decodeURIComponent(new URL(remoteUrl).pathname.split("/").pop()) || id; }
@@ -391,10 +552,26 @@ async function apiRemote(request, env) {
   }
 
   meta.files = meta.files || {};
-  meta.files[id] = { name: fname, size: realSize, type: ctype, uploadedAt: nowMM(), key };
+  meta.files[id] = {
+    name: fname, size: realSize, type: ctype,
+    uploadedAt: nowMM(), folderId: folderId || null, key,
+  };
   meta.totalBytes = (meta.totalBytes || 0) + realSize;
   await saveMeta(env, meta);
-  return json({ ok: true, id });
+
+  await saveProgress(env, pid, { total: realSize, loaded: realSize, done: true, error: null, ts: Date.now() });
+  return json({ ok: true, id, pid });
+}
+
+// --- Poll remote upload progress ---
+async function apiRemoteProgress(request, env) {
+  const url = new URL(request.url);
+  const pid = url.searchParams.get("pid");
+  if (!pid) return json({ error: "pid မပါပါ" }, 400);
+  const prog = await loadProgress(env, pid);
+  if (!prog) return json({ loaded: 0, total: 0, done: false, error: null });
+  if (prog.done) deleteProgress(env, pid).catch(() => {}); // cleanup once read after done
+  return json(prog);
 }
 
 async function apiDelete(request, env) {
@@ -411,11 +588,76 @@ async function apiDelete(request, env) {
   return json({ ok: true });
 }
 
+// ---- Folder: create ----
+async function apiFolderCreate(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  const name = (body.name || "").trim();
+  if (!name) return json({ error: "Folder နာမည် ထည့်ပါ" }, 400);
+  // prevent duplicate names
+  const dup = Object.values(meta.folders).some(f => f.name === name);
+  if (dup) return json({ error: "ဒီနာမည်နဲ့ folder ရှိပြီးသားပါ" }, 400);
+
+  const id = randId();
+  meta.folders[id] = { name, createdAt: nowMM() };
+  await saveMeta(env, meta);
+  return json({ ok: true, id });
+}
+
+// ---- Folder: rename ----
+async function apiFolderRename(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  const { id } = body;
+  const name = (body.name || "").trim();
+  if (!meta.folders[id]) return json({ error: "Folder မတွေ့ပါ" }, 404);
+  if (!name) return json({ error: "Folder နာမည် ထည့်ပါ" }, 400);
+  meta.folders[id].name = name;
+  await saveMeta(env, meta);
+  return json({ ok: true });
+}
+
+// ---- Folder: delete (files inside move back to root, not deleted) ----
+async function apiFolderDelete(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  const { id, deleteFiles } = body;
+  if (!meta.folders[id]) return json({ error: "Folder မတွေ့ပါ" }, 404);
+
+  for (const [fid, f] of Object.entries(meta.files)) {
+    if (f.folderId === id) {
+      if (deleteFiles) {
+        await env.R2.delete(f.key);
+        meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
+        delete meta.files[fid];
+      } else {
+        f.folderId = null; // move to root
+      }
+    }
+  }
+  delete meta.folders[id];
+  await saveMeta(env, meta);
+  return json({ ok: true });
+}
+
+// ---- Move a file into a folder (or root) ----
+async function apiMove(request, env) {
+  const meta = await loadMeta(env);
+  const body = await request.json().catch(() => ({}));
+  const { id, folderId } = body;
+  const f = meta.files?.[id];
+  if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
+  if (folderId && !meta.folders[folderId]) return json({ error: "Folder မတွေ့ပါ" }, 400);
+  f.folderId = folderId || null;
+  await saveMeta(env, meta);
+  return json({ ok: true });
+}
+
 // --- Create / update share link with duration ---
 async function apiShare(request, env) {
   const meta = await loadMeta(env);
   const body = await request.json().catch(() => ({}));
-  const { id, duration } = body; // duration: "2d","1w","1m","1y","lifetime","off"
+  const { id, duration } = body;
   const f = meta.files?.[id];
   if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
 
@@ -431,7 +673,7 @@ async function apiShare(request, env) {
     "1m": 30 * 86400e3,
     "1y": 365 * 86400e3,
   };
-  let expiresAt = null; // lifetime
+  let expiresAt = null;
   if (duration !== "lifetime") {
     const ms = map[duration];
     if (!ms) return json({ error: "သက်တမ်းမှားနေပါသည်" }, 400);
@@ -456,24 +698,22 @@ async function apiChangePass(request, env) {
   return json({ ok: true });
 }
 
-// --- Authed download (original file) ---
+// --- Authed download (with Range support so in-browser seek works) ---
 async function apiDownload(request, env) {
   const url = new URL(request.url);
   const id = url.searchParams.get("id");
+  const forceDl = url.searchParams.get("dl") === "1";
   const meta = await loadMeta(env);
   const f = meta.files?.[id];
   if (!f) return new Response("Not Found", { status: 404 });
-  const obj = await env.R2.get(f.key);
-  if (!obj) return new Response("Not Found", { status: 404 });
-  return new Response(obj.body, {
-    headers: {
-      "Content-Type": f.type || "application/octet-stream",
-      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(f.name)}`,
-    },
-  });
+
+  // If it's media and not forced download, serve inline so it can play & seek.
+  const isMedia = /^(image|video|audio|text)\//.test(f.type || "");
+  const disposition = (forceDl || !isMedia) ? "attachment" : "inline";
+  return await serveR2Object(request, env, f, disposition);
 }
 
-// --- Public share download (no auth, checks expiry) ---
+// --- Public share download (no auth, checks expiry, Range support) ---
 async function handleShare(request, env, token) {
   const meta = await loadMeta(env);
   let target = null;
@@ -486,17 +726,8 @@ async function handleShare(request, env, token) {
     return new Response("ဤ link သက်တမ်းကုန်သွားပါပြီ။ (မူရင်းဖိုင်မပျက်ပါ)", { status: 410 });
   }
 
-  const obj = await env.R2.get(target.key);
-  if (!obj) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
-
   const inline = /^(image|video|audio|text)\//.test(target.type || "");
-  return new Response(obj.body, {
-    headers: {
-      "Content-Type": target.type || "application/octet-stream",
-      "Content-Disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(target.name)}`,
-      "Cache-Control": "public, max-age=3600",
-    },
-  });
+  return await serveR2Object(request, env, target, inline ? "inline" : "attachment");
 }
 
 // ======================= HTML PAGES =======================
@@ -552,7 +783,7 @@ header h1{margin:0;font-size:20px}
 .wrap{max-width:900px;margin:0 auto;padding:16px}
 .bar{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
 .prog{height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden;margin-top:8px}
-.prog>i{display:block;height:100%;background:linear-gradient(90deg,#16a34a,#22c55e)}
+.prog>i{display:block;height:100%;background:linear-gradient(90deg,#16a34a,#22c55e);transition:width .3s}
 .prog.warn>i{background:linear-gradient(90deg,#f59e0b,#ef4444)}
 button{padding:9px 14px;border:0;border-radius:8px;background:#1e3c72;color:#fff;cursor:pointer;font-size:14px}
 button:hover{opacity:.9}
@@ -568,15 +799,24 @@ input,select{padding:9px;border:1px solid #ddd;border-radius:8px;font-size:14px}
 .acts button{font-size:13px;padding:6px 10px}
 .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;background:#dbeafe;color:#1e40af;margin-left:6px}
 .tag.exp{background:#fee2e2;color:#991b1b}
+.folderbox{background:#fff;border-radius:12px;padding:12px;margin-bottom:10px;box-shadow:0 2px 8px rgba(0,0,0,.06);
+display:flex;justify-content:space-between;align-items:center;gap:8px;cursor:pointer}
+.folderbox:hover{background:#f8fafc}
+.fbleft{display:flex;align-items:center;gap:8px;font-weight:600}
+.crumb{font-size:14px;color:#1e3c72;margin-bottom:10px;cursor:pointer}
+.crumb b{color:#111}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#222;color:#fff;
 padding:12px 20px;border-radius:8px;z-index:99;opacity:0;transition:.3s;font-size:14px;max-width:90%}
 .toast.show{opacity:1}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
 .modal.show{display:flex}
-.modal .box{background:#fff;border-radius:12px;padding:20px;max-width:380px;width:100%}
+.modal .box{background:#fff;border-radius:12px;padding:20px;max-width:420px;width:100%}
 .modal h3{margin:0 0 12px}
-.modal input{width:100%;margin:6px 0}
+.modal input,.modal select{width:100%;margin:6px 0}
 small{color:#888}
+.player{margin-top:10px}
+.player video,.player audio{width:100%;border-radius:8px;background:#000}
+.player img{max-width:100%;border-radius:8px}
 </style></head><body>
 <header>
 <h1>⚡ Fast Lugyi Storage</h1>
@@ -594,7 +834,19 @@ small{color:#888}
 </div>
 
 <div class="bar">
+<b>📂 Folder</b>
+<div class="row">
+<input type="text" id="newFolderName" placeholder="Folder အသစ်နာမည်" style="flex:1;min-width:160px">
+<button onclick="createFolder()">+ Folder ဆောက်မည်</button>
+</div>
+<small id="folderHint">ဖိုင်တင်ရင် အောက်က folder ထဲကို တင်ပါမယ်။</small>
+</div>
+
+<div class="bar">
 <b>📤 ဖုန်းထဲကဖိုင်တင်ရန် (Photo / Video / Txt / Music ...)</b>
+<div class="row">
+<select id="uploadFolder" style="min-width:160px"><option value="">📁 Root (folder မရွေး)</option></select>
+</div>
 <div class="row">
 <input type="file" id="fileInput" multiple>
 <button onclick="uploadLocal()">တင်မည်</button>
@@ -605,14 +857,20 @@ small{color:#888}
 <div class="bar">
 <b>🔗 Remote URL ဖြင့်တင်ရန် (1.5GB ထိ)</b>
 <div class="row">
+<select id="remoteFolder" style="min-width:160px"><option value="">📁 Root (folder မရွေး)</option></select>
+</div>
+<div class="row">
 <input type="text" id="remoteUrl" placeholder="https://..." style="flex:1;min-width:180px">
 <input type="text" id="remoteName" placeholder="ဖိုင်နာမည် (optional)">
-<button onclick="uploadRemote()">တင်မည်</button>
+<button id="remoteBtn" onclick="uploadRemote()">တင်မည်</button>
 </div>
 <div id="remoteStatus"><small></small></div>
+<div class="prog" id="remoteProgWrap" style="display:none"><i id="remoteProgBar" style="width:0%"></i></div>
 </div>
 
-<h3>📁 ဖိုင်များ</h3>
+<div id="crumb" class="crumb"></div>
+<h3 id="listTitle">📁 ဖိုင်များ</h3>
+<div id="folderList"></div>
 <div id="list"></div>
 
 </div>
@@ -620,7 +878,7 @@ small{color:#888}
 <!-- Share modal -->
 <div class="modal" id="shareModal"><div class="box">
 <h3>🔗 Share Link</h3>
-<select id="shareDur" style="width:100%;margin-bottom:10px">
+<select id="shareDur">
 <option value="2d">၂ ရက်</option>
 <option value="1w">၁ ပတ်</option>
 <option value="1m">၁ လ</option>
@@ -628,9 +886,17 @@ small{color:#888}
 <option value="lifetime">Lifetime (သက်တမ်းမကုန်)</option>
 <option value="off">Link ပိတ်မည်</option>
 </select>
-<button onclick="doShare()" style="width:100%">အတည်ပြုမည်</button>
+<button onclick="doShare()" style="width:100%;margin-top:6px">အတည်ပြုမည်</button>
 <div id="shareResult" style="margin-top:12px;word-break:break-all;font-size:13px"></div>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('shareModal')">ပိတ်မည်</button>
+</div></div>
+
+<!-- Move modal -->
+<div class="modal" id="moveModal"><div class="box">
+<h3>📁 Folder ထဲ ရွှေ့ရန်</h3>
+<select id="moveFolder"></select>
+<button onclick="doMove()" style="width:100%;margin-top:6px">ရွှေ့မည်</button>
+<button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('moveModal')">ပိတ်မည်</button>
 </div></div>
 
 <!-- Password modal -->
@@ -647,6 +913,9 @@ small{color:#888}
 
 <script>
 let currentShareId=null;
+let currentMoveId=null;
+let state={files:[],folders:[],totalBytes:0,maxBytes:0};
+let currentFolder=null; // null = root
 
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
 setTimeout(()=>t.classList.remove('show'),3000);}
@@ -654,21 +923,66 @@ function fmtSize(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed
 if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB';}
 function openModal(id){document.getElementById(id).classList.add('show');}
 function closeModal(id){document.getElementById(id).classList.remove('show');}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function escapeJs(s){return String(s).replace(/['\\\\]/g,'\\\\$&').replace(/"/g,'&quot;');}
 
 async function load(){
   const r=await fetch('/api/list');
   if(r.status===401){location.href='/login';return;}
   const d=await r.json();
+  state=d;
+
   // usage
   const pct=Math.min(100,(d.totalBytes/d.maxBytes*100)).toFixed(1);
   document.getElementById('usage').innerHTML=
     fmtSize(d.totalBytes)+' / '+fmtSize(d.maxBytes)+' ('+pct+'%)';
   const bar=document.getElementById('progBar');bar.style.width=pct+'%';
   document.getElementById('progWrap').className='prog'+(pct>85?' warn':'');
-  // list
+
+  // folder selects (upload + remote)
+  const optHtml='<option value="">📁 Root (folder မရွေး)</option>'+
+    d.folders.map(f=>'<option value="'+f.id+'">📁 '+escapeHtml(f.name)+'</option>').join('');
+  document.getElementById('uploadFolder').innerHTML=optHtml;
+  document.getElementById('remoteFolder').innerHTML=optHtml;
+
+  // if current folder was deleted, go to root
+  if(currentFolder && !d.folders.find(f=>f.id===currentFolder)) currentFolder=null;
+
+  render();
+}
+
+function render(){
+  const d=state;
+  const crumb=document.getElementById('crumb');
+  const folderList=document.getElementById('folderList');
   const list=document.getElementById('list');
-  if(!d.files.length){list.innerHTML='<p style="color:#888">ဖိုင်မရှိသေးပါ။</p>';return;}
-  list.innerHTML=d.files.map(f=>{
+  const title=document.getElementById('listTitle');
+
+  if(currentFolder){
+    const fo=d.folders.find(f=>f.id===currentFolder);
+    crumb.innerHTML='<span onclick="goRoot()">📁 Root</span> / <b>'+escapeHtml(fo?fo.name:'?')+'</b>';
+    title.textContent='📂 '+(fo?fo.name:'');
+    folderList.innerHTML=''; // no nested folders
+  }else{
+    crumb.innerHTML='<b>📁 Root</b>';
+    title.textContent='📁 ဖိုင်များ';
+    // show folders
+    folderList.innerHTML=d.folders.map(fo=>{
+      const cnt=d.files.filter(f=>f.folderId===fo.id).length;
+      return '<div class="folderbox"><div class="fbleft" onclick="openFolder(\\''+fo.id+'\\')">'+
+        '📁 '+escapeHtml(fo.name)+' <small>('+cnt+' ဖိုင်)</small></div>'+
+        '<div><button class="sec" onclick="event.stopPropagation();renameFolder(\\''+fo.id+'\\',\\''+escapeJs(fo.name)+'\\')">✏️</button> '+
+        '<button class="danger" onclick="event.stopPropagation();deleteFolder(\\''+fo.id+'\\',\\''+escapeJs(fo.name)+'\\')">🗑</button></div></div>';
+    }).join('');
+  }
+
+  // files in current view
+  const files=d.files.filter(f=>(f.folderId||null)===(currentFolder||null));
+  if(!files.length){
+    list.innerHTML='<p style="color:#888">ဤနေရာတွင် ဖိုင်မရှိသေးပါ။</p>';
+    return;
+  }
+  list.innerHTML=files.map(f=>{
     let shareTag='';
     if(f.share){
       const exp=f.share.expiresAt;
@@ -676,21 +990,61 @@ async function load(){
       else if(exp) shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
       else shareTag='<span class="tag">Lifetime</span>';
     }
+    const isVideo=/^video\\//.test(f.type||'');
+    const isAudio=/^audio\\//.test(f.type||'');
+    const isImage=/^image\\//.test(f.type||'');
+    let player='';
+    if(isVideo) player='<div class="player"><video controls preload="metadata" src="/api/download?id='+f.id+'"></video></div>';
+    else if(isAudio) player='<div class="player"><audio controls preload="metadata" src="/api/download?id='+f.id+'"></audio></div>';
+    else if(isImage) player='<div class="player"><img loading="lazy" src="/api/download?id='+f.id+'"></div>';
+
     return '<div class="file"><div class="top"><div>'+
       '<div class="fname">'+escapeHtml(f.name)+shareTag+'</div>'+
       '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type)+'<br>📅 '+f.uploadedAt+' (မြန်မာစံတော်ချိန်)</div>'+
-      '</div></div><div class="acts">'+
+      '</div></div>'+player+'<div class="acts">'+
       '<button onclick="dl(\\''+f.id+'\\')">⬇ Download</button>'+
       (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\')">📋 Link Copy</button>':'')+
       '<button class="sec" onclick="openShare(\\''+f.id+'\\')">🔗 Share</button>'+
+      '<button class="sec" onclick="openMove(\\''+f.id+'\\')">📁 ရွှေ့</button>'+
       '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+escapeJs(f.name)+'\\')">🗑 ဖျက်</button>'+
       '</div></div>';
   }).join('');
 }
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function escapeJs(s){return String(s).replace(/['\\\\]/g,'\\\\$&').replace(/"/g,'&quot;');}
 
-function dl(id){window.open('/api/download?id='+encodeURIComponent(id),'_blank');}
+function openFolder(id){currentFolder=id;render();}
+function goRoot(){currentFolder=null;render();}
+
+async function createFolder(){
+  const name=document.getElementById('newFolderName').value.trim();
+  if(!name){toast('Folder နာမည် ထည့်ပါ');return;}
+  const r=await fetch('/api/folder/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  const d=await r.json();
+  if(r.ok){toast('Folder ဆောက်ပြီးပါပြီ');document.getElementById('newFolderName').value='';load();}
+  else toast(d.error||'မဆောက်နိုင်ပါ');
+}
+async function renameFolder(id,old){
+  const name=prompt('Folder နာမည်အသစ်:',old);
+  if(name===null)return;
+  const r=await fetch('/api/folder/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name:name.trim()})});
+  const d=await r.json();
+  if(r.ok){toast('ပြောင်းပြီးပါပြီ');load();}else toast(d.error||'မရပါ');
+}
+async function deleteFolder(id,name){
+  const inside=state.files.filter(f=>f.folderId===id).length;
+  let deleteFiles=false;
+  if(inside>0){
+    const ch=confirm('"'+name+'" ထဲမှာ ဖိုင် '+inside+' ဖိုင်ရှိပါတယ်။\\n\\nOK = ဖိုင်တွေပါ အကုန်ဖျက်မည်\\nCancel = Folder ပဲဖျက်ပြီး ဖိုင်တွေကို Root သို့ ရွှေ့မည်');
+    deleteFiles=ch;
+  }else{
+    if(!confirm('"'+name+'" ကို ဖျက်မှာ သေချာလား?'))return;
+  }
+  const r=await fetch('/api/folder/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,deleteFiles})});
+  const d=await r.json();
+  if(r.ok){toast('Folder ဖျက်ပြီးပါပြီ');if(currentFolder===id)currentFolder=null;load();}
+  else toast(d.error||'မရပါ');
+}
+
+function dl(id){window.open('/api/download?id='+encodeURIComponent(id)+'&dl=1','_blank');}
 
 async function del(id,name){
   if(!confirm('"'+name+'" ကို အပြီးဖျက်မှာ သေချာလား?'))return;
@@ -699,10 +1053,11 @@ async function del(id,name){
   if(r.ok){toast('ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မဖျက်နိုင်ပါ');
 }
 
-// ---- Local upload: small files (<90MB) direct; large via presign ----
+// ---- Local upload ----
 const DIRECT_LIMIT=90*1024*1024;
 async function uploadLocal(){
   const inp=document.getElementById('fileInput');
+  const folderId=document.getElementById('uploadFolder').value;
   const files=[...inp.files];
   if(!files.length){toast('ဖိုင်ရွေးပါ');return;}
   const st=document.getElementById('upStatus').querySelector('small');
@@ -710,12 +1065,11 @@ async function uploadLocal(){
     st.textContent=file.name+' တင်နေသည်...';
     try{
       if(file.size<=DIRECT_LIMIT){
-        const fd=new FormData();fd.append('file',file);
+        const fd=new FormData();fd.append('file',file);if(folderId)fd.append('folderId',folderId);
         const r=await fetch('/api/upload',{method:'POST',body:fd});
         const d=await r.json();
         if(!r.ok)throw new Error(d.error);
       }else{
-        // presign -> PUT to R2 -> finalize
         const pr=await fetch('/api/presign',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({name:file.name,size:file.size,type:file.type})});
         const pd=await pr.json();
@@ -724,7 +1078,7 @@ async function uploadLocal(){
         const put=await fetch(pd.uploadUrl,{method:'PUT',body:file,headers:{'Content-Type':file.type||'application/octet-stream'}});
         if(!put.ok)throw new Error('R2 PUT failed '+put.status);
         const fr=await fetch('/api/finalize',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({id:pd.id,key:pd.key,name:file.name,size:file.size,type:file.type})});
+          body:JSON.stringify({id:pd.id,key:pd.key,name:file.name,size:file.size,type:file.type,folderId})});
         const fd2=await fr.json();
         if(!fr.ok)throw new Error(fd2.error);
       }
@@ -734,21 +1088,73 @@ async function uploadLocal(){
   st.textContent='';inp.value='';load();
 }
 
+// ---- Remote upload with progress polling ----
+let remotePoll=null;
 async function uploadRemote(){
   const url=document.getElementById('remoteUrl').value.trim();
   const name=document.getElementById('remoteName').value.trim();
+  const folderId=document.getElementById('remoteFolder').value;
   if(!url){toast('URL ထည့်ပါ');return;}
   const st=document.getElementById('remoteStatus').querySelector('small');
+  const btn=document.getElementById('remoteBtn');
+  const pw=document.getElementById('remoteProgWrap');
+  const pb=document.getElementById('remoteProgBar');
+  btn.disabled=true;
   st.textContent='Remote ဖိုင်တင်နေသည်... (ခဏစောင့်ပါ)';
-  const r=await fetch('/api/remote',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url,name})});
-  const d=await r.json();
-  st.textContent='';
-  if(r.ok){toast('Remote ဖိုင်တင်ပြီးပါပြီ');document.getElementById('remoteUrl').value='';
-    document.getElementById('remoteName').value='';load();}
-  else toast('❌ '+(d.error||'မတင်နိုင်ပါ'));
+  pw.style.display='block';pb.style.width='0%';
+
+  // We can't get pid until response returns, so poll after a short delay using a temp approach:
+  // The server returns pid in the final response; but to show live %, we start the request and poll
+  // using a pid we generate? -> Instead server controls pid. So we poll only after we know pid.
+  // Trick: open the request; meanwhile poll a shared latest-progress is complex.
+  // Simpler robust approach: send request, and the FIRST thing server does is create progress with a pid
+  // we pass in. So we generate pid on client and send it.
+  // (Handled below via clientPid.)
+
+  const clientPid=(crypto.randomUUID?crypto.randomUUID():Date.now()+''+Math.random()).replace(/-/g,'');
+
+  // start polling
+  remotePoll=setInterval(async()=>{
+    try{
+      const r=await fetch('/api/remote-progress?pid='+clientPid);
+      const p=await r.json();
+      if(p.total>0){
+        const pct=Math.min(100,(p.loaded/p.total*100)).toFixed(1);
+        pb.style.width=pct+'%';
+        st.textContent='တင်နေသည်... '+pct+'% ('+fmtSize(p.loaded)+' / '+fmtSize(p.total)+')';
+      }else if(p.loaded>0){
+        st.textContent='တင်နေသည်... '+fmtSize(p.loaded)+' (အရွယ်အစား မသိ)';
+        pb.style.width='50%';
+      }
+    }catch{}
+  },800);
+
+  try{
+    const r=await fetch('/api/remote',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url,name,folderId,pid:clientPid})});
+    const d=await r.json();
+    clearInterval(remotePoll);
+    if(r.ok){
+      pb.style.width='100%';
+      st.textContent='✅ တင်ပြီးပါပြီ';
+      document.getElementById('remoteUrl').value='';
+      document.getElementById('remoteName').value='';
+      toast('Remote ဖိုင်တင်ပြီးပါပြီ');
+      setTimeout(()=>{pw.style.display='none';st.textContent='';},1500);
+      load();
+    }else{
+      st.textContent='';pw.style.display='none';
+      toast('❌ '+(d.error||'မတင်နိုင်ပါ'));
+    }
+  }catch(e){
+    clearInterval(remotePoll);
+    st.textContent='';pw.style.display='none';
+    toast('❌ '+e.message);
+  }
+  btn.disabled=false;
 }
 
+// ---- Share ----
 function openShare(id){currentShareId=id;document.getElementById('shareResult').textContent='';openModal('shareModal');}
 async function doShare(){
   const dur=document.getElementById('shareDur').value;
@@ -767,6 +1173,24 @@ async function doShare(){
 function copyShare(token){copyText(location.origin+'/s/'+token);}
 function copyText(t){navigator.clipboard.writeText(t).then(()=>toast('📋 Copy ကူးပြီးပါပြီ'));}
 
+// ---- Move ----
+function openMove(id){
+  currentMoveId=id;
+  const sel=document.getElementById('moveFolder');
+  sel.innerHTML='<option value="">📁 Root</option>'+
+    state.folders.map(f=>'<option value="'+f.id+'">📁 '+escapeHtml(f.name)+'</option>').join('');
+  openModal('moveModal');
+}
+async function doMove(){
+  const folderId=document.getElementById('moveFolder').value;
+  const r=await fetch('/api/move',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:currentMoveId,folderId})});
+  const d=await r.json();
+  if(r.ok){toast('ရွှေ့ပြီးပါပြီ');closeModal('moveModal');load();}
+  else toast(d.error||'မရပါ');
+}
+
+// ---- Password ----
 function openPass(){document.getElementById('passErr').textContent='';
   document.getElementById('oldPass').value='';document.getElementById('newPass').value='';openModal('passModal');}
 async function doChangePass(){
