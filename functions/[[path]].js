@@ -706,54 +706,64 @@ async function apiMove(request, env) {
   return json({ ok: true });
 }
 
-// ======================= HTML PAGES =======================
-
 const LOGIN_HTML = `<!DOCTYPE html>
 <html lang="my"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fast Lugyi Storage • ဝင်ရန်</title>
 <style>
-:root{--brand1:#6d28d9;--brand2:#2563eb;--accent:#06b6d4}
+:root{--brand1:#7c3aed;--brand2:#2563eb;--accent:#06b6d4}
 *{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-background:linear-gradient(135deg,#0f172a,#1e1b4b 45%,#312e81);padding:16px;overflow:hidden;position:relative}
-body::before,body::after{content:"";position:absolute;border-radius:50%;filter:blur(80px);opacity:.55;z-index:0}
-body::before{width:340px;height:340px;background:#7c3aed;top:-80px;left:-60px}
-body::after{width:300px;height:300px;background:#06b6d4;bottom:-70px;right:-50px}
-.card{position:relative;z-index:1;background:rgba(255,255,255,.08);backdrop-filter:blur(18px);
-border:1px solid rgba(255,255,255,.18);padding:36px 30px;border-radius:22px;
-box-shadow:0 20px 60px rgba(0,0,0,.45);width:100%;max-width:390px;color:#fff}
-.logo{width:64px;height:64px;margin:0 auto 14px;border-radius:18px;display:flex;align-items:center;justify-content:center;
-background:linear-gradient(135deg,var(--brand1),var(--accent));box-shadow:0 8px 24px rgba(109,40,217,.5);font-size:30px}
-h1{margin:0 0 4px;font-size:23px;text-align:center;font-weight:700;
+background:radial-gradient(1200px 600px at 10% 0%,#1e1b4b,transparent),
+radial-gradient(1000px 500px at 90% 100%,#0c4a6e,transparent),
+linear-gradient(135deg,#0b1020,#111827 45%,#1e1b4b);
+padding:16px;overflow:hidden;position:relative}
+.orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.5;z-index:0;animation:float 9s ease-in-out infinite}
+.orb.a{width:360px;height:360px;background:#7c3aed;top:-90px;left:-70px}
+.orb.b{width:320px;height:320px;background:#06b6d4;bottom:-80px;right:-60px;animation-delay:-4s}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-26px)}}
+.card{position:relative;z-index:1;background:rgba(255,255,255,.07);backdrop-filter:blur(22px);
+border:1px solid rgba(255,255,255,.16);padding:38px 30px;border-radius:24px;
+box-shadow:0 30px 70px rgba(0,0,0,.5);width:100%;max-width:400px;color:#fff}
+.logo{width:66px;height:66px;margin:0 auto 16px;border-radius:20px;display:flex;align-items:center;justify-content:center;
+background:linear-gradient(135deg,var(--brand1),var(--accent));box-shadow:0 10px 30px rgba(124,58,237,.55);font-size:32px}
+h1{margin:0 0 4px;font-size:24px;text-align:center;font-weight:800;letter-spacing:.3px;
 background:linear-gradient(90deg,#c4b5fd,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
-.sub{text-align:center;color:rgba(255,255,255,.65);font-size:13px;margin-bottom:22px}
-.field{position:relative;margin:12px 0}
-.field input{width:100%;padding:13px 14px 13px 42px;border:1px solid rgba(255,255,255,.2);
-border-radius:12px;font-size:15px;background:rgba(255,255,255,.07);color:#fff;outline:none;transition:.2s}
+.sub{text-align:center;color:rgba(255,255,255,.62);font-size:13px;margin-bottom:24px}
+.field{position:relative;margin:13px 0}
+.field input{width:100%;padding:14px 14px 14px 44px;border:1px solid rgba(255,255,255,.18);
+border-radius:14px;font-size:15px;background:rgba(255,255,255,.06);color:#fff;outline:none;transition:.25s}
 .field input::placeholder{color:rgba(255,255,255,.5)}
-.field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(6,182,212,.25)}
-.field .ic{position:absolute;left:14px;top:50%;transform:translateY(-50%);opacity:.7}
-button{width:100%;padding:13px;margin-top:10px;border:0;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;color:#fff;
-background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 8px 22px rgba(37,99,235,.45);transition:.2s}
-button:hover{transform:translateY(-1px);box-shadow:0 12px 28px rgba(37,99,235,.55)}
-button:disabled{opacity:.6;cursor:not-allowed}
-.err{color:#fca5a5;font-size:13px;margin-top:10px;text-align:center;min-height:18px}
-.foot{text-align:center;margin-top:16px;font-size:11px;color:rgba(255,255,255,.45)}
+.field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(6,182,212,.25);background:rgba(255,255,255,.1)}
+.field .ic{position:absolute;left:15px;top:50%;transform:translateY(-50%);opacity:.7}
+button{width:100%;padding:14px;margin-top:12px;border:0;border-radius:14px;font-size:16px;font-weight:700;cursor:pointer;color:#fff;
+background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 10px 26px rgba(37,99,235,.45);transition:.25s;
+display:flex;align-items:center;justify-content:center;gap:8px}
+button:hover{transform:translateY(-2px);box-shadow:0 16px 34px rgba(37,99,235,.6)}
+button:disabled{opacity:.7;cursor:not-allowed;transform:none}
+.spin{width:18px;height:18px;border:2.5px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;
+animation:spin .7s linear infinite;display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.err{color:#fca5a5;font-size:13px;margin-top:12px;text-align:center;min-height:18px}
+.foot{text-align:center;margin-top:18px;font-size:11px;color:rgba(255,255,255,.45)}
 </style></head><body>
+<div class="orb a"></div><div class="orb b"></div>
 <div class="card">
 <div class="logo">⚡</div>
 <h1>Fast Lugyi Storage</h1>
 <div class="sub">🔒 လုံခြုံစိတ်ချရသော Cloud သိုလှောင်မှု</div>
 <div class="field"><span class="ic">👤</span><input id="u" placeholder="Username" autocomplete="username"></div>
 <div class="field"><span class="ic">🔑</span><input id="p" type="password" placeholder="Password" autocomplete="current-password"></div>
-<button id="btn" onclick="login()">🚀 ဝင်မည်</button>
+<button id="btn" onclick="login()"><span class="spin" id="spin"></span><span id="btnTxt">🚀 ဝင်မည်</span></button>
 <div class="err" id="err"></div>
 <div class="foot">Powered by Cloudflare R2 • Premium Edition</div>
 </div>
 <script>
 async function login(){
-  const btn=document.getElementById('btn');btn.disabled=true;btn.textContent='⏳ ဝင်နေသည်...';
+  const btn=document.getElementById('btn');
+  const spin=document.getElementById('spin');
+  const btnTxt=document.getElementById('btnTxt');
+  btn.disabled=true;spin.style.display='block';btnTxt.textContent='ဝင်နေသည်...';
   document.getElementById('err').textContent='';
   try{
     const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -762,7 +772,7 @@ async function login(){
     if(r.ok){location.href='/';return;}
     document.getElementById('err').textContent=d.error||'ဝင်၍မရပါ';
   }catch(e){document.getElementById('err').textContent='ကွန်ရက် ပြဿနာ';}
-  btn.disabled=false;btn.textContent='🚀 ဝင်မည်';
+  btn.disabled=false;spin.style.display='none';btnTxt.textContent='🚀 ဝင်မည်';
 }
 document.getElementById('p').addEventListener('keydown',e=>{if(e.key==='Enter')login();});
 document.getElementById('u').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('p').focus();});
@@ -774,71 +784,99 @@ const APP_HTML = `<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Fast Lugyi Storage</title>
 <style>
-:root{--brand1:#6d28d9;--brand2:#2563eb;--accent:#06b6d4;--bg:#0f172a;--card:#ffffff;--ink:#1e293b;--muted:#64748b}
+:root{--brand1:#7c3aed;--brand2:#2563eb;--accent:#06b6d4;--bg:#0f172a;--card:#ffffff;--ink:#1e293b;--muted:#64748b}
 *{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
-body{margin:0;background:linear-gradient(180deg,#eef2ff,#f8fafc);color:var(--ink);min-height:100vh}
+body{margin:0;background:
+radial-gradient(900px 500px at 100% -5%,#ede9fe,transparent),
+radial-gradient(700px 400px at -10% 0%,#cffafe,transparent),
+linear-gradient(180deg,#f5f7ff,#f8fafc);color:var(--ink);min-height:100vh}
 header{background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#fff;padding:16px 18px;
 display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
-box-shadow:0 6px 24px rgba(37,99,235,.35);position:sticky;top:0;z-index:20}
-.brand{display:flex;align-items:center;gap:10px}
-.brand .lg{width:40px;height:40px;border-radius:12px;background:rgba(255,255,255,.18);
-display:flex;align-items:center;justify-content:center;font-size:22px;backdrop-filter:blur(8px)}
-header h1{margin:0;font-size:19px;font-weight:700}
-.wrap{max-width:960px;margin:0 auto;padding:18px}
-.bar{background:var(--card);border-radius:16px;padding:18px;margin-bottom:16px;
-box-shadow:0 4px 18px rgba(15,23,42,.07);border:1px solid #eef0f5}
+box-shadow:0 8px 30px rgba(37,99,235,.4);position:sticky;top:0;z-index:20}
+.brand{display:flex;align-items:center;gap:12px}
+.brand .lg{width:42px;height:42px;border-radius:14px;background:rgba(255,255,255,.2);
+display:flex;align-items:center;justify-content:center;font-size:23px;backdrop-filter:blur(8px);
+box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}
+header h1{margin:0;font-size:19px;font-weight:800;letter-spacing:.3px}
+.wrap{max-width:980px;margin:0 auto;padding:18px}
+.bar{background:var(--card);border-radius:18px;padding:18px;margin-bottom:16px;
+box-shadow:0 6px 24px rgba(15,23,42,.07);border:1px solid #eef0f5}
 .bar b{font-size:15px}
-.prog{height:12px;background:#e5e7eb;border-radius:8px;overflow:hidden;margin-top:10px}
-.prog>i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#06b6d4);transition:width .5s}
+.prog{height:13px;background:#e9edf5;border-radius:9px;overflow:hidden;margin-top:10px}
+.prog>i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#06b6d4);transition:width .6s;border-radius:9px}
 .prog.warn>i{background:linear-gradient(90deg,#f59e0b,#ef4444)}
-button{padding:10px 15px;border:0;border-radius:10px;color:#fff;cursor:pointer;font-size:14px;font-weight:600;transition:.18s;
-background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 4px 12px rgba(37,99,235,.3)}
-button:hover{transform:translateY(-1px)}
-button.sec{background:#eef2f7;color:#334155;box-shadow:none}
+button{padding:10px 15px;border:0;border-radius:11px;color:#fff;cursor:pointer;font-size:14px;font-weight:600;transition:.18s;
+background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 5px 14px rgba(37,99,235,.32)}
+button:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(37,99,235,.42)}
+button:active{transform:translateY(0)}
+button.sec{background:#eef2f8;color:#334155;box-shadow:none}
 button.sec:hover{background:#e2e8f0}
-button.danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
-button.ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.4);box-shadow:none}
-input,select{padding:10px;border:1px solid #d8dde6;border-radius:10px;font-size:14px;background:#fff;outline:none}
+button.danger{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 5px 14px rgba(239,68,68,.3)}
+button.ghost{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.35);box-shadow:none}
+button.ghost:hover{background:rgba(255,255,255,.22)}
+input,select{padding:11px;border:1px solid #d8dde6;border-radius:11px;font-size:14px;background:#fff;outline:none;transition:.2s}
 input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(6,182,212,.18)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
-.sec-title{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px}
-.crumb{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:14px;margin-bottom:12px}
-.crumb a{color:var(--brand2);cursor:pointer;text-decoration:none;font-weight:600}
+.sec-title{display:flex;align-items:center;gap:8px;font-weight:800;font-size:15px}
+.crumb{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:14px;margin-bottom:14px;
+background:#fff;padding:10px 14px;border-radius:12px;border:1px solid #eef0f5;box-shadow:0 3px 12px rgba(15,23,42,.05)}
+.crumb a{color:var(--brand2);cursor:pointer;text-decoration:none;font-weight:700}
+.crumb a:hover{text-decoration:underline}
 .crumb span.sep{color:#94a3b8}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:16px}
-.fold{background:linear-gradient(135deg,#fff,#f5f7ff);border:1px solid #e4e8f5;border-radius:14px;padding:14px;cursor:pointer;
-display:flex;flex-direction:column;gap:6px;transition:.18s;position:relative}
-.fold:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(37,99,235,.15);border-color:#c7d2fe}
-.fold .ico{font-size:30px}
-.fold .nm{font-weight:600;word-break:break-word}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.fold{background:linear-gradient(135deg,#fff,#f3f5ff);border:1px solid #e4e8f5;border-radius:16px;padding:15px;cursor:pointer;
+display:flex;flex-direction:column;gap:6px;transition:.2s;position:relative}
+.fold:hover{transform:translateY(-3px);box-shadow:0 12px 26px rgba(37,99,235,.16);border-color:#c7d2fe}
+.fold .ico{font-size:32px}
+.fold .nm{font-weight:700;word-break:break-word}
 .fold .ct{font-size:12px;color:var(--muted)}
-.fold .x{position:absolute;top:8px;right:8px;border:0;background:#fee2e2;color:#b91c1c;border-radius:8px;
-width:26px;height:26px;font-size:13px;padding:0;box-shadow:none;display:none}
+.fold .x{position:absolute;top:8px;right:8px;border:0;background:#fee2e2;color:#b91c1c;border-radius:9px;
+width:28px;height:28px;font-size:13px;padding:0;box-shadow:none;display:none}
 .fold:hover .x{display:block}
-.file{background:var(--card);border-radius:14px;padding:14px;margin-bottom:10px;
-box-shadow:0 3px 14px rgba(15,23,42,.06);border:1px solid #eef0f5;transition:.18s}
-.file:hover{box-shadow:0 8px 22px rgba(15,23,42,.1)}
+.file{background:var(--card);border-radius:16px;padding:15px;margin-bottom:11px;
+box-shadow:0 4px 16px rgba(15,23,42,.06);border:1px solid #eef0f5;transition:.2s}
+.file:hover{box-shadow:0 12px 26px rgba(15,23,42,.1);transform:translateY(-1px)}
 .file .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
-.ficon{font-size:26px;flex-shrink:0}
-.fname{font-weight:600;word-break:break-all}
-.meta{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
-.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
-.acts button{font-size:13px;padding:7px 11px}
-.tag{display:inline-block;font-size:11px;padding:2px 9px;border-radius:10px;background:#dbeafe;color:#1e40af;margin-left:6px;font-weight:600}
+.ficon{font-size:28px;flex-shrink:0;width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+background:linear-gradient(135deg,#eef2ff,#e0f2fe)}
+.fname{font-weight:700;word-break:break-all}
+.meta{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6}
+.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:13px}
+.acts button{font-size:13px;padding:8px 12px}
+.tag{display:inline-block;font-size:11px;padding:2px 9px;border-radius:10px;background:#dbeafe;color:#1e40af;margin-left:6px;font-weight:700}
 .tag.exp{background:#fee2e2;color:#991b1b}
 .tag.life{background:#dcfce7;color:#166534}
+.pager{display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap;margin:18px 0 6px}
+.pager button{padding:8px 13px;min-width:40px}
+.pager .pinfo{font-size:13px;color:var(--muted);font-weight:600;padding:0 6px}
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;
-padding:13px 22px;border-radius:12px;z-index:99;opacity:0;transition:.3s;font-size:14px;max-width:90%;box-shadow:0 8px 26px rgba(0,0,0,.4)}
+padding:13px 22px;border-radius:13px;z-index:99;opacity:0;transition:.3s;font-size:14px;max-width:90%;box-shadow:0 10px 30px rgba(0,0,0,.45);pointer-events:none}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(-4px)}
-.modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(4px);display:none;
-align-items:center;justify-content:center;z-index:50;padding:16px}
+/* ===== Custom Modal (premium) ===== */
+.modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(6px);display:none;
+align-items:center;justify-content:center;z-index:50;padding:16px;animation:fadeIn .2s ease}
 .modal.show{display:flex}
-.modal .box{background:#fff;border-radius:18px;padding:24px;max-width:400px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.4)}
-.modal h3{margin:0 0 14px;font-size:18px}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.modal .box{background:#fff;border-radius:22px;padding:26px;max-width:420px;width:100%;
+box-shadow:0 30px 70px rgba(0,0,0,.45);animation:pop .25s cubic-bezier(.2,.9,.3,1.2);border:1px solid #eef0f5}
+@keyframes pop{from{opacity:0;transform:scale(.9) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.modal h3{margin:0 0 16px;font-size:19px;display:flex;align-items:center;gap:9px;font-weight:800}
 .modal input,.modal select{width:100%;margin:6px 0}
+.modal .mico{width:56px;height:56px;border-radius:16px;display:flex;align-items:center;justify-content:center;
+font-size:28px;margin:0 auto 12px}
+.modal .mico.ask{background:linear-gradient(135deg,#fef3c7,#fde68a)}
+.modal .mico.del{background:linear-gradient(135deg,#fee2e2,#fecaca)}
+.modal .mtext{text-align:center;color:#475569;font-size:14px;line-height:1.6;margin-bottom:18px;word-break:break-word}
+.modal .mbtns{display:flex;gap:10px}
+.modal .mbtns button{flex:1}
 small{color:var(--muted)}
-.empty{text-align:center;color:var(--muted);padding:40px 0}
-.empty .big{font-size:46px}
+.empty{text-align:center;color:var(--muted);padding:46px 0}
+.empty .big{font-size:48px}
+.spin{width:16px;height:16px;border:2.4px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;
+animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;margin-right:6px}
+.spin.dark{border-color:rgba(124,58,237,.25);border-top-color:#7c3aed}
+@keyframes spin{to{transform:rotate(360deg)}}
+.statusline{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--muted);min-height:20px}
 </style></head><body>
 <header>
 <div class="brand"><div class="lg">⚡</div><h1>Fast Lugyi Storage</h1></div>
@@ -862,7 +900,7 @@ small{color:var(--muted)}
 <button onclick="uploadLocal()">⬆ တင်မည်</button>
 <button class="sec" onclick="openNewFolder()">📁 Folder အသစ်</button>
 </div>
-<div id="upStatus"><small></small></div>
+<div class="statusline" id="upStatus"></div>
 </div>
 
 <div class="bar">
@@ -870,9 +908,9 @@ small{color:var(--muted)}
 <div class="row" style="margin-top:10px">
 <input type="text" id="remoteUrl" placeholder="https://..." style="flex:1;min-width:180px">
 <input type="text" id="remoteName" placeholder="ဖိုင်နာမည် (optional)">
-<button onclick="uploadRemote()">⬆ တင်မည်</button>
+<button id="remoteBtn" onclick="uploadRemote()">⬆ တင်မည်</button>
 </div>
-<div id="remoteStatus"><small></small></div>
+<div class="statusline" id="remoteStatus"></div>
 </div>
 
 <div class="crumb" id="crumb"></div>
@@ -882,6 +920,7 @@ small{color:var(--muted)}
 
 <div class="sec-title" style="margin-bottom:10px">📁 ဖိုင်များ</div>
 <div id="list"></div>
+<div class="pager" id="pager"></div>
 
 </div>
 
@@ -896,7 +935,7 @@ small{color:var(--muted)}
 <option value="lifetime">♾️ Lifetime (သက်တမ်းမကုန်)</option>
 <option value="off">🚫 Link ပိတ်မည်</option>
 </select>
-<button onclick="doShare()" style="width:100%;margin-top:10px">✅ အတည်ပြုမည်</button>
+<button onclick="doShare()" style="width:100%;margin-top:12px">✅ အတည်ပြုမည်</button>
 <div id="shareResult" style="margin-top:12px;word-break:break-all;font-size:13px"></div>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('shareModal')">ပိတ်မည်</button>
 </div></div>
@@ -905,7 +944,7 @@ small{color:var(--muted)}
 <div class="modal" id="folderModal"><div class="box">
 <h3>📁 Folder အသစ်ဆောက်ရန်</h3>
 <input type="text" id="folderName" placeholder="Folder နာမည်" maxlength="80">
-<button onclick="doCreateFolder()" style="width:100%;margin-top:8px">✅ ဆောက်မည်</button>
+<button onclick="doCreateFolder()" style="width:100%;margin-top:10px">✅ ဆောက်မည်</button>
 <div id="folderErr" style="color:#d33;font-size:13px;margin-top:8px"></div>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('folderModal')">ပိတ်မည်</button>
 </div></div>
@@ -914,7 +953,7 @@ small{color:var(--muted)}
 <div class="modal" id="moveModal"><div class="box">
 <h3>📦 ဖိုင်ရွှေ့ရန်</h3>
 <select id="moveTarget"></select>
-<button onclick="doMove()" style="width:100%;margin-top:10px">✅ ရွှေ့မည်</button>
+<button onclick="doMove()" style="width:100%;margin-top:12px">✅ ရွှေ့မည်</button>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('moveModal')">ပိတ်မည်</button>
 </div></div>
 
@@ -923,9 +962,20 @@ small{color:var(--muted)}
 <h3>🔑 Password ပြောင်းရန်</h3>
 <input type="password" id="oldPass" placeholder="လက်ရှိ password">
 <input type="password" id="newPass" placeholder="password အသစ်">
-<button onclick="doChangePass()" style="width:100%;margin-top:8px">✅ ပြောင်းမည်</button>
+<button onclick="doChangePass()" style="width:100%;margin-top:10px">✅ ပြောင်းမည်</button>
 <div id="passErr" style="color:#d33;font-size:13px;margin-top:8px"></div>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('passModal')">ပိတ်မည်</button>
+</div></div>
+
+<!-- Custom confirm modal -->
+<div class="modal" id="confirmModal"><div class="box">
+<div class="mico" id="confirmIco">❓</div>
+<h3 id="confirmTitle" style="justify-content:center"></h3>
+<div class="mtext" id="confirmText"></div>
+<div class="mbtns">
+<button class="sec" onclick="confirmResolve(false)">မလုပ်တော့ပါ</button>
+<button class="danger" id="confirmOk" onclick="confirmResolve(true)">အတည်ပြုမည်</button>
+</div>
 </div></div>
 
 <div class="toast" id="toast"></div>
@@ -935,6 +985,10 @@ let currentFolder="";          // "" = root
 let currentShareId=null;
 let currentMoveId=null;
 let allFolders=[];             // for move dropdown
+let currentPage=1;             // pagination
+const PAGE_SIZE=12;            // files per page
+let lastFiles=[];              // cached files of current folder
+let _confirmCb=null;
 
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
 setTimeout(()=>t.classList.remove('show'),3000);}
@@ -945,6 +999,45 @@ function closeModal(id){document.getElementById(id).classList.remove('show');}
 function fileIcon(t){t=t||'';if(t.startsWith('video/'))return'🎬';if(t.startsWith('image/'))return'🖼️';
 if(t.startsWith('audio/'))return'🎵';if(t.startsWith('text/'))return'📄';
 if(t.includes('pdf'))return'📕';if(t.includes('zip')||t.includes('rar'))return'🗜️';return'📦';}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function escapeJs(s){return String(s).replace(/['\\\\]/g,'\\\\$&').replace(/"/g,'&quot;');}
+
+/* ===== Custom confirm (replaces window.confirm) ===== */
+function confirmBox({title,text,okText='အတည်ပြုမည်',danger=true}){
+  return new Promise(res=>{
+    _confirmCb=res;
+    document.getElementById('confirmIco').textContent=danger?'🗑':'❓';
+    document.getElementById('confirmIco').className='mico '+(danger?'del':'ask');
+    document.getElementById('confirmTitle').textContent=title||'အတည်ပြုပါ';
+    document.getElementById('confirmText').textContent=text||'';
+    const ok=document.getElementById('confirmOk');
+    ok.textContent=okText;ok.className=danger?'danger':'';
+    openModal('confirmModal');
+  });
+}
+function confirmResolve(v){closeModal('confirmModal');if(_confirmCb){_confirmCb(v);_confirmCb=null;}}
+
+/* ===== Routing with back-button support =====
+   Browser back button => move up to parent folder / stay in app,
+   never bounce to login page. */
+function setRoute(folder,push){
+  currentFolder=folder;
+  currentPage=1;
+  const url='#'+(folder?('f/'+folder):'');
+  if(push){history.pushState({folder},'',url);}
+  load();
+}
+window.addEventListener('popstate',e=>{
+  const f=(e.state&&e.state.folder!==undefined)?e.state.folder:parseHash();
+  currentFolder=f||"";
+  currentPage=1;
+  load();
+});
+function parseHash(){
+  const h=location.hash||'';
+  const m=h.match(/^#f\\/(.+)$/);
+  return m?decodeURIComponent(m[1]):"";
+}
 
 async function load(){
   const r=await fetch('/api/list?folder='+encodeURIComponent(currentFolder));
@@ -977,42 +1070,65 @@ async function load(){
     ).join('');
   }
 
-  // files
-  const list=document.getElementById('list');
-  if(!d.files.length){
-    list.innerHTML='<div class="empty"><div class="big">🗂️</div>ဤနေရာတွင် ဖိုင်မရှိသေးပါ။</div>';
-  }else{
-    list.innerHTML=d.files.map(f=>{
-      let shareTag='';
-      if(f.share){
-        const exp=f.share.expiresAt;
-        if(exp&&Date.now()>exp) shareTag='<span class="tag exp">Link ကုန်</span>';
-        else if(exp) shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
-        else shareTag='<span class="tag life">♾️ Lifetime</span>';
-      }
-      return '<div class="file"><div class="top">'+
-        '<div style="display:flex;gap:10px"><div class="ficon">'+fileIcon(f.type)+'</div><div>'+
-        '<div class="fname">'+escapeHtml(f.name)+shareTag+'</div>'+
-        '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type)+'<br>🕒 '+f.uploadedAt+' (မြန်မာစံတော်ချိန်)</div>'+
-        '</div></div></div><div class="acts">'+
-        '<button onclick="dl(\\''+f.id+'\\')">⬇ Download</button>'+
-        (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\')">📋 Link</button>':'')+
-        '<button class="sec" onclick="openShare(\\''+f.id+'\\')">🔗 Share</button>'+
-        '<button class="sec" onclick="openMove(\\''+f.id+'\\')">📦 ရွှေ့</button>'+
-        '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+escapeJs(f.name)+'\\')">🗑 ဖျက်</button>'+
-        '</div></div>';
-    }).join('');
-  }
+  // files (with pagination)
+  lastFiles=d.files;
+  renderFiles();
 }
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function escapeJs(s){return String(s).replace(/['\\\\]/g,'\\\\$&').replace(/"/g,'&quot;');}
 
-function goFolder(id){currentFolder=id;load();}
+function renderFiles(){
+  const list=document.getElementById('list');
+  const pager=document.getElementById('pager');
+  const total=lastFiles.length;
+
+  if(!total){
+    list.innerHTML='<div class="empty"><div class="big">🗂️</div>ဤနေရာတွင် ဖိုင်မရှိသေးပါ။</div>';
+    pager.innerHTML='';
+    return;
+  }
+
+  const pages=Math.ceil(total/PAGE_SIZE);
+  if(currentPage>pages)currentPage=pages;
+  if(currentPage<1)currentPage=1;
+  const start=(currentPage-1)*PAGE_SIZE;
+  const slice=lastFiles.slice(start,start+PAGE_SIZE);
+
+  list.innerHTML=slice.map(f=>{
+    let shareTag='';
+    if(f.share){
+      const exp=f.share.expiresAt;
+      if(exp&&Date.now()>exp) shareTag='<span class="tag exp">Link ကုန်</span>';
+      else if(exp) shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
+      else shareTag='<span class="tag life">♾️ Lifetime</span>';
+    }
+    return '<div class="file"><div class="top">'+
+      '<div style="display:flex;gap:11px"><div class="ficon">'+fileIcon(f.type)+'</div><div>'+
+      '<div class="fname">'+escapeHtml(f.name)+shareTag+'</div>'+
+      '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type)+'<br>🕒 '+f.uploadedAt+' (မြန်မာစံတော်ချိန်)</div>'+
+      '</div></div></div><div class="acts">'+
+      '<button onclick="dl(\\''+f.id+'\\')">⬇ Download</button>'+
+      (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\')">📋 Link</button>':'')+
+      '<button class="sec" onclick="openShare(\\''+f.id+'\\')">🔗 Share</button>'+
+      '<button class="sec" onclick="openMove(\\''+f.id+'\\')">📦 ရွှေ့</button>'+
+      '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+escapeJs(f.name)+'\\')">🗑 ဖျက်</button>'+
+      '</div></div>';
+  }).join('');
+
+  // pager controls
+  if(pages<=1){pager.innerHTML='';return;}
+  let p='<button class="sec" '+(currentPage<=1?'disabled':'')+' onclick="gotoPage('+(currentPage-1)+')">‹ နောက်သို့</button>';
+  p+='<span class="pinfo">စာမျက်နှာ '+currentPage+' / '+pages+'</span>';
+  p+='<button class="sec" '+(currentPage>=pages?'disabled':'')+' onclick="gotoPage('+(currentPage+1)+')">ရှေ့သို့ ›</button>';
+  pager.innerHTML=p;
+}
+function gotoPage(p){currentPage=p;renderFiles();window.scrollTo({top:document.getElementById('list').offsetTop-80,behavior:'smooth'});}
+
+function goFolder(id){setRoute(id,true);}
 
 function dl(id){window.open('/api/download?id='+encodeURIComponent(id),'_blank');}
 
 async function del(id,name){
-  if(!confirm('"'+name+'" ကို အပြီးဖျက်မှာ သေချာလား?'))return;
+  const ok=await confirmBox({title:'ဖိုင်ဖျက်မည်',text:'"'+name+'" ကို အပြီးဖျက်မှာ သေချာလား?',okText:'🗑 ဖျက်မည်'});
+  if(!ok)return;
   const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
   const d=await r.json();
   if(r.ok){toast('🗑 ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မဖျက်နိုင်ပါ');
@@ -1031,7 +1147,8 @@ async function doCreateFolder(){
   else document.getElementById('folderErr').textContent=d.error||'မရပါ';
 }
 async function delFolder(id,name){
-  if(!confirm('"'+name+'" folder နှင့် အထဲက ဖိုင်အားလုံးကို ဖျက်မှာ သေချာလား?'))return;
+  const ok=await confirmBox({title:'Folder ဖျက်မည်',text:'"'+name+'" folder နှင့် အထဲက ဖိုင်အားလုံးကို ဖျက်မှာ သေချာလား?',okText:'🗑 ဖျက်မည်'});
+  if(!ok)return;
   const r=await fetch('/api/folder/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
   const d=await r.json();
   if(r.ok){toast('🗑 Folder ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မရပါ');
@@ -1040,11 +1157,6 @@ async function delFolder(id,name){
 // ---- Move ----
 async function openMove(id){
   currentMoveId=id;
-  // fetch full folder list (all)
-  const r=await fetch('/api/list?folder=');
-  // gather all folders by walking — simpler: use a dedicated traversal via repeated calls is heavy,
-  // so we just offer root + folders visible from list endpoint recursively isn't available;
-  // we request a flat list through breadcrumb-less approach:
   await buildAllFolders();
   const sel=document.getElementById('moveTarget');
   sel.innerHTML='<option value="">🏠 Home (root)</option>'+
@@ -1052,7 +1164,6 @@ async function openMove(id){
   openModal('moveModal');
 }
 async function buildAllFolders(){
-  // BFS through folders using list endpoint
   allFolders=[];
   const visited=new Set();
   async function walk(folderId,prefix){
@@ -1081,9 +1192,9 @@ async function uploadLocal(){
   const inp=document.getElementById('fileInput');
   const files=[...inp.files];
   if(!files.length){toast('ဖိုင်ရွေးပါ');return;}
-  const st=document.getElementById('upStatus').querySelector('small');
+  const st=document.getElementById('upStatus');
   for(const file of files){
-    st.textContent='⏳ '+file.name+' တင်နေသည်...';
+    st.innerHTML='<span class="spin dark"></span> '+escapeHtml(file.name)+' တင်နေသည်...';
     try{
       if(file.size<=DIRECT_LIMIT){
         const fd=new FormData();fd.append('file',file);fd.append('folder',currentFolder);
@@ -1095,7 +1206,7 @@ async function uploadLocal(){
           body:JSON.stringify({name:file.name,size:file.size,type:file.type,folder:currentFolder})});
         const pd=await pr.json();
         if(!pr.ok)throw new Error(pd.error);
-        st.textContent='⏳ '+file.name+' (ကြီးမားသောဖိုင်) R2 သို့ တိုက်ရိုက်တင်နေသည်...';
+        st.innerHTML='<span class="spin dark"></span> '+escapeHtml(file.name)+' (ကြီးမားသောဖိုင်) R2 သို့ တိုက်ရိုက်တင်နေသည်...';
         const put=await fetch(pd.uploadUrl,{method:'PUT',body:file,headers:{'Content-Type':file.type||'application/octet-stream'}});
         if(!put.ok)throw new Error('R2 PUT failed '+put.status);
         const fr=await fetch('/api/finalize',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1104,24 +1215,28 @@ async function uploadLocal(){
         if(!fr.ok)throw new Error(fd2.error);
       }
       toast('✅ '+file.name+' တင်ပြီးပါပြီ');
-    }catch(e){toast('❌ '+file.name+': '+e.message);st.textContent='';return;}
+    }catch(e){toast('❌ '+file.name+': '+e.message);st.innerHTML='';return;}
   }
-  st.textContent='';inp.value='';load();
+  st.innerHTML='';inp.value='';load();
 }
 
 async function uploadRemote(){
   const url=document.getElementById('remoteUrl').value.trim();
   const name=document.getElementById('remoteName').value.trim();
   if(!url){toast('URL ထည့်ပါ');return;}
-  const st=document.getElementById('remoteStatus').querySelector('small');
-  st.textContent='⏳ Remote ဖိုင်တင်နေသည်... (ခဏစောင့်ပါ)';
-  const r=await fetch('/api/remote',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url,name,folder:currentFolder})});
-  const d=await r.json();
-  st.textContent='';
-  if(r.ok){toast('✅ Remote ဖိုင်တင်ပြီးပါပြီ');document.getElementById('remoteUrl').value='';
-    document.getElementById('remoteName').value='';load();}
-  else toast('❌ '+(d.error||'မတင်နိုင်ပါ'));
+  const st=document.getElementById('remoteStatus');
+  const btn=document.getElementById('remoteBtn');
+  btn.disabled=true;
+  st.innerHTML='<span class="spin dark"></span> Remote ဖိုင်တင်နေသည်... (ခဏစောင့်ပါ)';
+  try{
+    const r=await fetch('/api/remote',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url,name,folder:currentFolder})});
+    const d=await r.json();
+    if(r.ok){toast('✅ Remote ဖိုင်တင်ပြီးပါပြီ');document.getElementById('remoteUrl').value='';
+      document.getElementById('remoteName').value='';load();}
+    else toast('❌ '+(d.error||'မတင်နိုင်ပါ'));
+  }catch(e){toast('❌ ကွန်ရက် ပြဿနာ');}
+  st.innerHTML='';btn.disabled=false;
 }
 
 function openShare(id){currentShareId=id;document.getElementById('shareResult').textContent='';openModal('shareModal');}
@@ -1133,7 +1248,7 @@ async function doShare(){
   if(!r.ok){toast(d.error||'မရပါ');return;}
   if(d.share){
     const link=location.origin+'/s/'+d.share.token;
-    document.getElementById('shareResult').innerHTML='<b>🔗 Link:</b><br>'+link+
+    document.getElementById('shareResult').innerHTML='<b>🔗 Link:</b><br>'+escapeHtml(link)+
       '<br><button style="margin-top:8px" onclick="copyText(\\''+link+'\\')">📋 Copy</button>';
     toast('✅ Share link ဖန်တီးပြီးပါပြီ');
   }else{document.getElementById('shareResult').textContent='🚫 Link ပိတ်လိုက်ပါပြီ။';toast('Link ပိတ်ပြီး');}
@@ -1159,6 +1274,9 @@ async function logout(){
   location.href='/login';
 }
 
+// initial route from URL hash, then push base state so back stays inside app
+currentFolder=parseHash();
+history.replaceState({folder:currentFolder},'',location.hash||'#');
 load();
 </script>
 </body></html>`;
