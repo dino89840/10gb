@@ -244,8 +244,11 @@ export async function onRequest(context) {
 
   try {
     // ---------- PUBLIC share download (no auth) ----------
+    // supports both /s/{token}  and  /s/{token}/{filename}
     if (path.startsWith("/s/")) {
-      return await handleShare(request, env, path.slice(3));
+      const rest = path.slice(3);
+      const token = rest.split("/")[0]; // filename အပိုင်းကို ဖယ်၊ token ပဲ ယူ
+      return await handleShare(request, env, token);
     }
 
     // ---------- Login API ----------
@@ -281,6 +284,7 @@ export async function onRequest(context) {
     if (path === "/api/share" && request.method === "POST") return await apiShare(request, env);
     if (path === "/api/changepass" && request.method === "POST") return await apiChangePass(request, env);
     if (path === "/api/download" && request.method === "GET") return await apiDownload(request, env);
+    if (path === "/api/view" && request.method === "GET") return await apiView(request, env);
     // folder routes
     if (path === "/api/folder/create" && request.method === "POST") return await apiFolderCreate(request, env);
     if (path === "/api/folder/delete" && request.method === "POST") return await apiFolderDelete(request, env);
@@ -522,10 +526,27 @@ async function apiRemote(request, env) {
     return json({ error: "Storage 10GB ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
   }
 
+  // ---- ဖိုင်နာမည် ဆုံးဖြတ်ခြင်း (extension ပါအောင် ပိုကောင်းအောင် ပြင်ထား) ----
   let fname = name;
   if (!fname) {
-    try { fname = decodeURIComponent(new URL(remoteUrl).pathname.split("/").pop()) || id; }
-    catch { fname = id; }
+    try {
+      // 1) URL path ထဲက နောက်ဆုံး segment ကို ယူ
+      let raw = decodeURIComponent(new URL(remoteUrl).pathname.split("/").pop() || "");
+      // query string ပါလာရင် ဖယ်
+      raw = raw.split("?")[0].split("#")[0];
+      // 2) Content-Disposition header ထဲမှာ filename ပါရင် အဲ့ဒါကို ဦးစားပေး
+      const cd = resp.headers.get("Content-Disposition") || "";
+      const mStar = /filename\*=(?:UTF-8'')?([^;]+)/i.exec(cd);
+      const mPlain = /filename="?([^";]+)"?/i.exec(cd);
+      if (mStar) raw = decodeURIComponent(mStar[1].trim());
+      else if (mPlain) raw = mPlain[1].trim();
+      fname = raw && raw.trim() ? raw.trim() : id;
+    } catch { fname = id; }
+  }
+  // 3) extension မရှိရင် content-type ကနေ မှန်းပြီး ထည့်ပေး
+  if (!/\.[a-z0-9]{1,8}$/i.test(fname)) {
+    const ext = extFromType(ctype);
+    if (ext) fname = fname + "." + ext;
   }
 
   meta.files = meta.files || {};
@@ -533,6 +554,21 @@ async function apiRemote(request, env) {
   meta.totalBytes = (meta.totalBytes || 0) + realSize;
   await saveMeta(env, meta);
   return json({ ok: true, id });
+}
+
+// content-type => extension (remote ဖိုင်နာမည်တွင် extension မပါရင် သုံးရန်)
+function extFromType(ctype) {
+  const map = {
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/gif": "gif",
+    "image/webp": "webp", "image/bmp": "bmp", "image/svg+xml": "svg",
+    "video/mp4": "mp4", "video/webm": "webm", "video/x-matroska": "mkv",
+    "video/quicktime": "mov", "video/x-msvideo": "avi", "video/mpeg": "mpeg",
+    "audio/mpeg": "mp3", "audio/wav": "wav", "audio/ogg": "ogg", "audio/aac": "aac",
+    "audio/flac": "flac", "audio/x-m4a": "m4a",
+    "application/pdf": "pdf", "application/zip": "zip",
+    "application/x-rar-compressed": "rar", "text/plain": "txt",
+  };
+  return map[(ctype || "").split(";")[0].trim().toLowerCase()] || "";
 }
 
 async function apiDelete(request, env) {
@@ -579,7 +615,8 @@ async function apiShare(request, env) {
   const token = f.share?.token || randId();
   f.share = { token, expiresAt };
   await saveMeta(env, meta);
-  return json({ ok: true, share: { token, expiresAt } });
+  // share link မှာ ဖိုင်နာမည် ပါအောင် ပြန်ပေး (frontend က သုံးမယ်)
+  return json({ ok: true, share: { token, expiresAt, name: f.name } });
 }
 
 async function apiChangePass(request, env) {
@@ -603,6 +640,17 @@ async function apiDownload(request, env) {
   if (!f) return new Response("Not Found", { status: 404 });
   // inlineDefault=false -> download as attachment, but range still supported
   return await serveObject(request, env, f, { inlineDefault: false });
+}
+
+// --- Authed VIEW (inline preview: image/video/audio plays in browser) ---
+async function apiView(request, env) {
+  const url = new URL(request.url);
+  const id = url.searchParams.get("id");
+  const meta = await loadMeta(env);
+  const f = meta.files?.[id];
+  if (!f) return new Response("Not Found", { status: 404 });
+  // inlineDefault=true -> media plays inline & supports seeking
+  return await serveObject(request, env, f, { inlineDefault: true });
 }
 
 // --- Public share download (no auth, checks expiry) — WITH RANGE/SEEK SUPPORT ---
@@ -713,12 +761,16 @@ const LOGIN_HTML = `<!DOCTYPE html>
 <style>
 :root{--brand1:#7c3aed;--brand2:#2563eb;--accent:#06b6d4}
 *{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
+html,body{height:100%}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
 background:radial-gradient(1200px 600px at 10% 0%,#1e1b4b,transparent),
 radial-gradient(1000px 500px at 90% 100%,#0c4a6e,transparent),
 linear-gradient(135deg,#0b1020,#111827 45%,#1e1b4b);
-padding:16px;overflow:hidden;position:relative}
-.orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.5;z-index:0;animation:float 9s ease-in-out infinite}
+background-attachment:fixed;
+padding:16px;position:relative;overflow-x:hidden}
+/* orb တွေကို fixed ပြောင်းပြီး scroll လုပ်ရင် page မလှုပ်အောင် pointer-events:none ထည့်ထား */
+.orb{position:fixed;border-radius:50%;filter:blur(90px);opacity:.5;z-index:0;pointer-events:none;
+animation:float 9s ease-in-out infinite;will-change:transform}
 .orb.a{width:360px;height:360px;background:#7c3aed;top:-90px;left:-70px}
 .orb.b{width:320px;height:320px;background:#06b6d4;bottom:-80px;right:-60px;animation-delay:-4s}
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-26px)}}
@@ -838,8 +890,9 @@ box-shadow:0 4px 16px rgba(15,23,42,.06);border:1px solid #eef0f5;transition:.2s
 .file:hover{box-shadow:0 12px 26px rgba(15,23,42,.1);transform:translateY(-1px)}
 .file .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
 .ficon{font-size:28px;flex-shrink:0;width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;
-background:linear-gradient(135deg,#eef2ff,#e0f2fe)}
-.fname{font-weight:700;word-break:break-all}
+background:linear-gradient(135deg,#eef2ff,#e0f2fe);cursor:pointer}
+.fname{font-weight:700;word-break:break-all;cursor:pointer;color:#1e293b;text-decoration:none}
+.fname:hover{color:var(--brand2);text-decoration:underline}
 .meta{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:13px}
 .acts button{font-size:13px;padding:8px 12px}
@@ -869,6 +922,18 @@ font-size:28px;margin:0 auto 12px}
 .modal .mtext{text-align:center;color:#475569;font-size:14px;line-height:1.6;margin-bottom:18px;word-break:break-word}
 .modal .mbtns{display:flex;gap:10px}
 .modal .mbtns button{flex:1}
+/* ===== Preview modal (image/video/audio) ===== */
+.modal .pbox{background:#0f172a;border-radius:22px;padding:18px;max-width:880px;width:100%;
+box-shadow:0 30px 70px rgba(0,0,0,.6);animation:pop .25s cubic-bezier(.2,.9,.3,1.2);border:1px solid #1e293b;color:#fff}
+.modal .pbox . phead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.modal .pbox .ptitle{font-weight:700;font-size:15px;word-break:break-all}
+.modal .pbox .pclose{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.3);
+border-radius:10px;width:36px;height:36px;padding:0;flex-shrink:0;box-shadow:none}
+.modal .pbox .pbody{display:flex;align-items:center;justify-content:center;min-height:120px}
+.modal .pbox img{max-width:100%;max-height:70vh;border-radius:12px;display:block}
+.modal .pbox video{max-width:100%;max-height:70vh;border-radius:12px;background:#000;width:100%}
+.modal .pbox audio{width:100%}
+.modal .pbox .pna{padding:30px;text-align:center;color:#cbd5e1;font-size:14px}
 small{color:var(--muted)}
 .empty{text-align:center;color:var(--muted);padding:46px 0}
 .empty .big{font-size:48px}
@@ -923,6 +988,15 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <div class="pager" id="pager"></div>
 
 </div>
+
+<!-- Preview modal -->
+<div class="modal" id="previewModal"><div class="pbox">
+<div class="phead">
+<div class="ptitle" id="previewTitle"></div>
+<button class="pclose" onclick="closePreview()">✖</button>
+</div>
+<div class="pbody" id="previewBody"></div>
+</div></div>
 
 <!-- Share modal -->
 <div class="modal" id="shareModal"><div class="box">
@@ -1017,6 +1091,31 @@ function confirmBox({title,text,okText='အတည်ပြုမည်',danger=t
 }
 function confirmResolve(v){closeModal('confirmModal');if(_confirmCb){_confirmCb(v);_confirmCb=null;}}
 
+/* ===== File preview (image / video / audio inline) ===== */
+function openPreview(id,name,type){
+  type=type||'';
+  document.getElementById('previewTitle').textContent=name;
+  const body=document.getElementById('previewBody');
+  const src='/api/view?id='+encodeURIComponent(id);
+  if(type.startsWith('image/')){
+    body.innerHTML='<img src="'+src+'" alt="'+escapeHtml(name)+'">';
+  }else if(type.startsWith('video/')){
+    body.innerHTML='<video src="'+src+'" controls autoplay playsinline></video>';
+  }else if(type.startsWith('audio/')){
+    body.innerHTML='<audio src="'+src+'" controls autoplay></audio>';
+  }else if(type.startsWith('text/')){
+    body.innerHTML='<iframe src="'+src+'" style="width:100%;height:60vh;border:0;border-radius:12px;background:#fff"></iframe>';
+  }else{
+    body.innerHTML='<div class="pna">ဤဖိုင်အမျိုးအစားကို preview မပြနိုင်ပါ။<br>Download လုပ်ပြီး ကြည့်ပါ။</div>';
+  }
+  openModal('previewModal');
+}
+function closePreview(){
+  const body=document.getElementById('previewBody');
+  body.innerHTML=''; // media ကို ရပ်စေရန် (autoplay video/audio ဆက်မဖွင့်အောင်)
+  closeModal('previewModal');
+}
+
 /* ===== Routing with back-button support =====
    Browser back button => move up to parent folder / stay in app,
    never bounce to login page. */
@@ -1100,16 +1199,21 @@ function renderFiles(){
       else if(exp) shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
       else shareTag='<span class="tag life">♾️ Lifetime</span>';
     }
+    const tEsc=escapeJs(f.type||'');
+    const nEsc=escapeJs(f.name);
+    // icon နဲ့ ဖိုင်နာမည် နှစ်ခုလုံး နှိပ်ရင် preview ဖွင့်
     return '<div class="file"><div class="top">'+
-      '<div style="display:flex;gap:11px"><div class="ficon">'+fileIcon(f.type)+'</div><div>'+
-      '<div class="fname">'+escapeHtml(f.name)+shareTag+'</div>'+
+      '<div style="display:flex;gap:11px">'+
+      '<div class="ficon" title="ကြည့်ရန်" onclick="openPreview(\\''+f.id+'\\',\\''+nEsc+'\\',\\''+tEsc+'\\')">'+fileIcon(f.type)+'</div><div>'+
+      '<div class="fname" title="ကြည့်ရန်" onclick="openPreview(\\''+f.id+'\\',\\''+nEsc+'\\',\\''+tEsc+'\\')">'+escapeHtml(f.name)+'</div>'+shareTag+
       '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type)+'<br>🕒 '+f.uploadedAt+' (မြန်မာစံတော်ချိန်)</div>'+
       '</div></div></div><div class="acts">'+
+      '<button class="sec" onclick="openPreview(\\''+f.id+'\\',\\''+nEsc+'\\',\\''+tEsc+'\\')">👁 ကြည့်</button>'+
       '<button onclick="dl(\\''+f.id+'\\')">⬇ Download</button>'+
-      (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\')">📋 Link</button>':'')+
+      (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\',\\''+nEsc+'\\')">📋 Link</button>':'')+
       '<button class="sec" onclick="openShare(\\''+f.id+'\\')">🔗 Share</button>'+
       '<button class="sec" onclick="openMove(\\''+f.id+'\\')">📦 ရွှေ့</button>'+
-      '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+escapeJs(f.name)+'\\')">🗑 ဖျက်</button>'+
+      '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+nEsc+'\\')">🗑 ဖျက်</button>'+
       '</div></div>';
   }).join('');
 
@@ -1247,14 +1351,25 @@ async function doShare(){
   const d=await r.json();
   if(!r.ok){toast(d.error||'မရပါ');return;}
   if(d.share){
-    const link=location.origin+'/s/'+d.share.token;
+    // share link မှာ ဖိုင်နာမည် ပါအောင်: /s/{token}/{filename}
+    const link=buildShareLink(d.share.token,d.share.name);
     document.getElementById('shareResult').innerHTML='<b>🔗 Link:</b><br>'+escapeHtml(link)+
-      '<br><button style="margin-top:8px" onclick="copyText(\\''+link+'\\')">📋 Copy</button>';
+      '<br><button style="margin-top:8px" onclick="copyText(\\''+escapeJs(link)+'\\')">📋 Copy</button>';
     toast('✅ Share link ဖန်တီးပြီးပါပြီ');
   }else{document.getElementById('shareResult').textContent='🚫 Link ပိတ်လိုက်ပါပြီ။';toast('Link ပိတ်ပြီး');}
   load();
 }
-function copyShare(token){copyText(location.origin+'/s/'+token);}
+// share link တွင် ဖိုင်နာမည် ထည့်ပေးခြင်း (browser က ဒေါင်းရင် နာမည်အမှန် ပေါ်အောင်)
+function buildShareLink(token,name){
+  let base=location.origin+'/s/'+token;
+  if(name){
+    // path-safe filename (slash မပါအောင်)
+    const safe=encodeURIComponent(name).replace(/%2F/g,'_');
+    base+='/'+safe;
+  }
+  return base;
+}
+function copyShare(token,name){copyText(buildShareLink(token,name));}
 function copyText(t){navigator.clipboard.writeText(t).then(()=>toast('📋 Copy ကူးပြီးပါပြီ'));}
 
 function openPass(){document.getElementById('passErr').textContent='';
