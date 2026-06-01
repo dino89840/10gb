@@ -2,6 +2,7 @@
 // Cloudflare Pages Functions + Object Storage (single-file)
 // Multi-user • Invite-code register • Per-user isolation
 // PBKDF2 password hashing • 5-day session • Upload progress
+// v2: concurrency-safe metadata (CAS+retry) • secret check • escape fix
 // ==========================================================
 
 const PER_USER_BYTES = 10 * 1024 * 1024 * 1024;          // user တစ်ယောက် 10 GB
@@ -14,6 +15,7 @@ const SESSION_MS = SESSION_DAYS * 24 * 60 * 60 * 1000;
 const MAX_PARALLEL_UPLOAD = 3;
 const PBKDF2_ITER = 100000;
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const META_MAX_RETRY = 6;                                // CAS retry count
 
 // ---- Abuse-prevention settings (no mail / no OTP) ----
 const REQUIRE_INVITE = false;          // true ဆိုရင် register လုပ်ဖို့ invite code လို
@@ -58,18 +60,18 @@ function html(body) {
   });
 }
 
-// ---- constant-time compare ----
+// ---- constant-time compare (length-safe) ----
 function safeEqual(a, b) {
-  a = String(a || "");
-  b = String(b || "");
-  if (a.length !== b.length) {
-    let diff = 1;
-    const max = Math.max(a.length, b.length, 1);
-    for (let i = 0; i < max; i++) diff |= (a.charCodeAt(i % a.length || 0) ^ b.charCodeAt(i % b.length || 0));
-    return false;
+  a = String(a == null ? "" : a);
+  b = String(b == null ? "" : b);
+  // အရွယ်မတူရင်လည်း တူသလောက် အချိန်ယူ — early return မလုပ်
+  const len = Math.max(a.length, b.length, 1);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i++) {
+    const ca = i < a.length ? a.charCodeAt(i) : 0;
+    const cb = i < b.length ? b.charCodeAt(i) : 0;
+    diff |= ca ^ cb;
   }
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
 
@@ -155,26 +157,92 @@ function sameOrigin(request, url) {
   return false;
 }
 
-// ---- Per-user metadata ----
+// ===================================================================
+// ====== Per-user metadata (CONCURRENCY-SAFE: CAS + retry) ==========
+// ===================================================================
 function userMetaKey(username) {
   return `users/${username}/index.json`;
 }
-async function loadMeta(env, username) {
+
+// raw load + etag ပြန်ပေး (CAS အတွက်)
+async function loadMetaRaw(env, username) {
   const obj = await env.R2.get(userMetaKey(username));
-  if (!obj) return { totalBytes: 0, files: {}, folders: {} };
+  if (!obj) return { meta: { totalBytes: 0, files: {}, folders: {} }, etag: null };
+  let m;
   try {
-    const m = JSON.parse(await obj.text());
-    m.files = m.files || {};
-    m.folders = m.folders || {};
-    m.totalBytes = m.totalBytes || 0;
-    return m;
-  } catch { return { totalBytes: 0, files: {}, folders: {} }; }
+    m = JSON.parse(await obj.text());
+  } catch {
+    m = { totalBytes: 0, files: {}, folders: {} };
+  }
+  m.files = m.files || {};
+  m.folders = m.folders || {};
+  m.totalBytes = m.totalBytes || 0;
+  // R2Object.etag (quote မပါ) ကို သုံး
+  return { meta: m, etag: obj.etag || null };
 }
-async function saveMeta(env, username, meta) {
-  await env.R2.put(userMetaKey(username), JSON.stringify(meta), {
-    httpMetadata: { contentType: "application/json" },
-  });
+
+// read-only အတွက် (list, download စသည် — ပြင်ဖို့မဟုတ်)
+async function loadMeta(env, username) {
+  const { meta } = await loadMetaRaw(env, username);
+  return meta;
 }
+
+function metaPutOptions(etag) {
+  const opts = { httpMetadata: { contentType: "application/json" } };
+  if (etag) {
+    // etag ရှိရင် — ဒီ version မပြောင်းသေးမှသာ ရေး (compare-and-swap)
+    opts.onlyIf = { etagMatches: etag };
+  } else {
+    // file မရှိသေးရင် — တခြားသူ မဆောက်ထားသေးမှသာ ရေး
+    opts.onlyIf = { etagDoesNotMatch: "*" };
+  }
+  return opts;
+}
+
+// အဓိက concurrency-safe helper:
+// mutate(meta) ကို ခေါ်ပြီး ပြန်ရလာတဲ့ meta ကို conditional-put လုပ်တယ်။
+// conflict (null ပြန်) ဆိုရင် reload ပြန်ဖတ်ပြီး mutate ပြန်ခေါ်တယ်။
+// mutate function က { meta, etag } reload ပြီးတိုင်း အသစ်က meta ပေါ်မှာ run ဖို့
+// pure ဖြစ်ဖို့လို — ဆိုလို mutate ထဲမှာ R2 side-effect (file delete) တွေ မလုပ်ပါနဲ့။
+// အဲ့ဒါမျိုးအတွက် commit ပြီးမှ side-effect လုပ်ဖို့ afterCommit array သုံးပါ။
+async function updateMeta(env, username, mutate) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < META_MAX_RETRY; attempt++) {
+    const { meta, etag } = await loadMetaRaw(env, username);
+    let result;
+    try {
+      result = mutate(meta); // { ok, status?, body?, error? } ပြန်ပေးနိုင်
+    } catch (e) {
+      // mutate ထဲ early-return logic အတွက်
+      if (e && e.__metaResult) return e.__metaResult;
+      throw e;
+    }
+    // mutate က ok:false ပြန်ရင် (validation fail) ချက်ချင်း ပြန်ထွက် — save မလုပ်
+    if (result && result.abort) {
+      return result.value;
+    }
+    const put = await env.R2.put(
+      userMetaKey(username),
+      JSON.stringify(meta),
+      metaPutOptions(etag)
+    );
+    if (put !== null) {
+      // အောင်မြင် — ဒီ version ကို အောင်မြင်စွာ ရေးပြီး
+      return result ? result.value : true;
+    }
+    // conflict — တခြား write တစ်ခု ဝင်လာ၊ exponential-ish backoff ပြီး retry
+    lastErr = "conflict";
+    await sleep(40 + attempt * 60 + Math.floor(Math.random() * 50));
+  }
+  // retry အကုန်ပြီးတောင် conflict — caller ကို error
+  throw new Error("meta_conflict");
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// abort helper — mutate ထဲ validation fail ဖြစ်ရင် save မလုပ်ဘဲ ထွက်
+function metaAbort(value) { return { abort: true, value }; }
+function metaCommit(value) { return { abort: false, value }; }
 
 // ---- User account store ----
 function userKey(username) {
@@ -213,7 +281,6 @@ async function saveRegLock(env, lock) {
 }
 
 // ---- Invite codes store ----
-// invites.json format: { "CODE123": { used:false, usedBy:null, createdAt:"..." }, ... }
 async function loadInvites(env) {
   const obj = await env.R2.get(INVITE_KEY);
   if (!obj) return {};
@@ -225,7 +292,7 @@ async function saveInvites(env, inv) {
   });
 }
 
-// ---- total user counter (cheap approximate via meta file) ----
+// ---- total user counter ----
 const USERCOUNT_KEY = "__meta__/usercount.json";
 async function loadUserCount(env) {
   const obj = await env.R2.get(USERCOUNT_KEY);
@@ -233,6 +300,19 @@ async function loadUserCount(env) {
   try { return JSON.parse(await obj.text()).count || 0; } catch { return 0; }
 }
 async function bumpUserCount(env) {
+  // CAS နဲ့ atomic bump
+  for (let i = 0; i < 5; i++) {
+    const obj = await env.R2.get(USERCOUNT_KEY);
+    let c = 0, etag = null;
+    if (obj) { try { c = JSON.parse(await obj.text()).count || 0; } catch {} etag = obj.etag; }
+    const opts = { };
+    if (etag) opts.onlyIf = { etagMatches: etag };
+    else opts.onlyIf = { etagDoesNotMatch: "*" };
+    const put = await env.R2.put(USERCOUNT_KEY, JSON.stringify({ count: c + 1 }), opts);
+    if (put !== null) return c + 1;
+    await sleep(30 + i * 40);
+  }
+  // fallback — best effort
   const c = await loadUserCount(env);
   await env.R2.put(USERCOUNT_KEY, JSON.stringify({ count: c + 1 }));
   return c + 1;
@@ -330,7 +410,6 @@ function parseRange(rangeHeader, size) {
   return { offset: start, length: end - start + 1, end };
 }
 
-// serveObject — extraCache ဖြင့် share / private cache ခွဲ
 async function serveObject(request, env, f, { inlineDefault = false, cacheControl = "private, max-age=3600" } = {}) {
   const head = await env.R2.head(f.key);
   if (!head) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
@@ -391,6 +470,11 @@ export async function onRequest(context) {
   const url = new URL(request.url);
   const path = url.pathname;
 
+  // ---- startup-time secret check (silently-insecure ဖြစ်တာ ကာကွယ်) ----
+  if (!env.SESSION_SECRET || String(env.SESSION_SECRET).length < 16) {
+    return json({ error: "server misconfigured: SESSION_SECRET missing" }, 500);
+  }
+
   try {
     // ---------- PUBLIC share download (no auth) ----------
     if (path.startsWith("/s/")) {
@@ -416,7 +500,7 @@ export async function onRequest(context) {
       });
     }
 
-    // ---------- Admin: invite code generate (protected by ADMIN_KEY) ----------
+    // ---------- Admin: invite code generate ----------
     if (path === "/api/admin/invite" && request.method === "POST") {
       return await handleAdminInvite(request, env);
     }
@@ -469,6 +553,9 @@ export async function onRequest(context) {
 
     return new Response("Not Found", { status: 404 });
   } catch (err) {
+    if (err && err.message === "meta_conflict") {
+      return json({ error: "အလုပ်များနေသည် — ခဏနေ ပြန်ကြိုးစားပါ။" }, 503);
+    }
     return json({ error: "server error" }, 500);
   }
 }
@@ -490,7 +577,6 @@ async function handleRegister(request, env) {
     return json({ error: "Password အနည်းဆုံး ၆ လုံး ထားပါ။" }, 400);
   }
 
-  // --- total user cap ---
   if (MAX_TOTAL_USERS > 0) {
     const count = await loadUserCount(env);
     if (count >= MAX_TOTAL_USERS) {
@@ -498,7 +584,6 @@ async function handleRegister(request, env) {
     }
   }
 
-  // --- IP per-day registration limit ---
   const regLock = await loadRegLock(env);
   const dayKey = todayKeyMM();
   const ipRec = regLock[ip] || { day: dayKey, count: 0 };
@@ -507,7 +592,6 @@ async function handleRegister(request, env) {
     return json({ error: "ဤ IP မှ ယနေ့ အကောင့်ဖွင့်ခွင့် ပြည့်သွားပါပြီ။ မနက်ဖြန် ပြန်ကြိုးစားပါ။" }, 429);
   }
 
-  // --- invite code check ---
   let invites = null;
   if (REQUIRE_INVITE) {
     if (!invite) return json({ error: "Invite code လိုအပ်ပါသည်။" }, 400);
@@ -530,12 +614,21 @@ async function handleRegister(request, env) {
     createdAt: nowMM(),
     regIp: ip,
   };
-  await saveUser(env, account);
 
-  // empty meta ဖန်တီး
-  await saveMeta(env, account.username, { totalBytes: 0, files: {}, folders: {} });
+  // account အရင်ဆောက် — duplicate-create race ကာကွယ်ဖို့ etagDoesNotMatch
+  const created = await env.R2.put(
+    userKey(account.username),
+    JSON.stringify(account),
+    { httpMetadata: { contentType: "application/json" }, onlyIf: { etagDoesNotMatch: "*" } }
+  );
+  if (created === null) {
+    return json({ error: "ဤ Username ကို သုံးပြီးသားဖြစ်ပါသည်။" }, 409);
+  }
 
-  // --- invite ကို used မှတ် ---
+  await env.R2.put(userMetaKey(account.username),
+    JSON.stringify({ totalBytes: 0, files: {}, folders: {} }),
+    { httpMetadata: { contentType: "application/json" } });
+
   if (REQUIRE_INVITE && invites) {
     invites[invite].used = true;
     invites[invite].usedBy = account.username;
@@ -543,7 +636,6 @@ async function handleRegister(request, env) {
     await saveInvites(env, invites);
   }
 
-  // --- counters bump ---
   ipRec.count += 1;
   regLock[ip] = ipRec;
   await saveRegLock(env, regLock);
@@ -555,7 +647,6 @@ async function handleRegister(request, env) {
   });
 }
 
-// Admin invite generate — header  x-admin-key: <ADMIN_KEY>
 async function handleAdminInvite(request, env) {
   const key = request.headers.get("x-admin-key") || "";
   if (!env.ADMIN_KEY || !safeEqual(key, env.ADMIN_KEY)) {
@@ -621,7 +712,7 @@ async function handleLogin(request, env) {
   }, 401);
 }
 
-// ======================= File Handlers (per-user) =======================
+// ======================= File Handlers (per-user, CAS-safe) =======================
 
 async function apiList(request, env, username) {
   const meta = await loadMeta(env, username);
@@ -660,23 +751,24 @@ async function apiList(request, env, username) {
     totalBytes: meta.totalBytes || 0, maxBytes: PER_USER_BYTES,
   });
 }
-
 async function apiUpload(request, env, username) {
-  const meta = await loadMeta(env, username);
   const form = await request.formData();
   const file = form.get("file");
   const folder = (form.get("folder") || "").toString();
   const customName = (form.get("name") || "").toString();
   if (!file || typeof file === "string") return json({ error: "ဖိုင်မပါပါ" }, 400);
-  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
   const size = file.size;
-  if ((meta.totalBytes || 0) + size > PER_USER_BYTES) {
+  const id = randId();
+  const key = `users/${username}/files/${id}`;
+
+  // loose pre-check
+  const pre = await loadMeta(env, username);
+  if (folder && !pre.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
+  if ((pre.totalBytes || 0) + size > PER_USER_BYTES) {
     return json({ error: "သိုလှောင်ခန့် ပြည့်သွားပါပြီ။ တင်၍မရပါ။" }, 413);
   }
 
-  const id = randId();
-  const key = `users/${username}/files/${id}`;
   await env.R2.put(key, file.stream(), {
     httpMetadata: { contentType: file.type || "application/octet-stream" },
   });
@@ -687,15 +779,46 @@ async function apiUpload(request, env, username) {
     if (origExt) fname += origExt;
   }
 
-  meta.files = meta.files || {};
-  meta.files[id] = {
-    name: fname, size,
-    type: file.type || "application/octet-stream",
-    uploadedAt: nowMM(), folder, key,
-  };
-  meta.totalBytes = (meta.totalBytes || 0) + size;
-  await saveMeta(env, username, meta);
-  return json({ ok: true, id });
+  try {
+    const resp = await commitUpload(env, username, {
+      id, key, size, fname, folder,
+      type: file.type || "application/octet-stream",
+    });
+    if (resp.status === 413 || resp.status === 400) {
+      await env.R2.delete(key).catch(() => {});
+    }
+    return resp;
+  } catch (e) {
+    await env.R2.delete(key).catch(() => {});
+    throw e;
+  }
+}
+
+
+  // updateMeta က response object ပြန်ပေးတယ် — ဒါပေမယ့် .then ထဲမှာ return လုပ်လို့
+  // ဒီနေရာ ပြန်ခေါ်ဖို့ structure ပြောင်း — ရှင်းအောင် အောက်မှာ ပြန်ရေး
+  return await commitUpload(env, username, { id, key, size, file, fname, folder });
+}
+
+// upload commit ကို သပ်သပ် function — ထပ်ခါ မရှုပ်အောင်
+async function commitUpload(env, username, { id, key, size, fname, folder, type }) {
+  const resp = await updateMeta(env, username, (meta) => {
+    if (folder && !meta.folders[folder]) {
+      return metaAbort(json({ error: "Folder မတွေ့ပါ", __cleanup: true }, 400));
+    }
+    if ((meta.totalBytes || 0) + size > PER_USER_BYTES) {
+      return metaAbort(json({ error: "သိုလှောင်ခန့် ကျော်သွားသဖြင့် ဖျက်လိုက်ပါပြီ။", __cleanup: true }, 413));
+    }
+    meta.files = meta.files || {};
+    meta.files[id] = {
+      name: fname, size,
+      type: type || "application/octet-stream",
+      uploadedAt: nowMM(), folder: folder || "", key,
+    };
+    meta.totalBytes = (meta.totalBytes || 0) + size;
+    return metaCommit(json({ ok: true, id }));
+  });
+  return resp;
 }
 
 async function apiPresign(request, env, username) {
@@ -715,11 +838,9 @@ async function apiPresign(request, env, username) {
 }
 
 async function apiFinalize(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id, key, name, type, folder } = body;
   if (!id || !key) return json({ error: "id/key မပါပါ" }, 400);
-  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
   if (key !== `users/${username}/files/${id}` || !/^[a-f0-9]{32}$/.test(id)) {
     return json({ error: "invalid key" }, 400);
   }
@@ -727,29 +848,45 @@ async function apiFinalize(request, env, username) {
   const head = await env.R2.head(key);
   if (!head) return json({ error: "ဖိုင်မတွေ့ပါ" }, 400);
   const realSize = head.size;
+  const ctype = type || head.httpMetadata?.contentType || "application/octet-stream";
 
-  if ((meta.totalBytes || 0) + realSize > PER_USER_BYTES) {
-    await env.R2.delete(key);
-    return json({ error: "သိုလှောင်ခန့် ကျော်သွားသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
+  const resp = await updateMeta(env, username, (meta) => {
+    if (folder && !meta.folders[folder]) {
+      return metaAbort(json({ error: "Folder မတွေ့ပါ", __cleanup: true }, 400));
+    }
+    // ထပ်တင်မိ (double-finalize) ဆို totalBytes ထပ်မပေါင်းအောင်
+    if (meta.files && meta.files[id]) {
+      return metaAbort(json({ ok: true, id }));
+    }
+    if ((meta.totalBytes || 0) + realSize > PER_USER_BYTES) {
+      return metaAbort(json({ error: "သိုလှောင်ခန့် ကျော်သွားသဖြင့် ဖျက်လိုက်ပါပြီ။", __cleanup: true }, 413));
+    }
+    meta.files = meta.files || {};
+    meta.files[id] = {
+      name: cleanName(name, id), size: realSize,
+      type: ctype, uploadedAt: nowMM(), folder: folder || "", key,
+    };
+    meta.totalBytes = (meta.totalBytes || 0) + realSize;
+    return metaCommit(json({ ok: true, id }));
+  });
+
+  // cleanup orphan
+  if (resp.status === 413 || resp.status === 400) {
+    await env.R2.delete(key).catch(() => {});
   }
-
-  meta.files = meta.files || {};
-  meta.files[id] = {
-    name: cleanName(name, id), size: realSize,
-    type: type || head.httpMetadata?.contentType || "application/octet-stream",
-    uploadedAt: nowMM(), folder: folder || "", key,
-  };
-  meta.totalBytes = (meta.totalBytes || 0) + realSize;
-  await saveMeta(env, username, meta);
-  return json({ ok: true, id });
+  return resp;
 }
 
 async function apiRemote(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { url: remoteUrl, name, folder } = body;
   if (!remoteUrl) return json({ error: "URL မပါပါ" }, 400);
-  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
+
+  // folder/quota pre-check
+  {
+    const pre = await loadMeta(env, username);
+    if (folder && !pre.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
+  }
 
   let parsed;
   try { parsed = new URL(remoteUrl); } catch { return json({ error: "URL မှားနေပါသည်" }, 400); }
@@ -768,9 +905,6 @@ async function apiRemote(request, env, username) {
   if (declared && declared > MAX_REMOTE_BYTES) {
     return json({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးနေပါသည်။" }, 413);
   }
-  if (declared && (meta.totalBytes || 0) + declared > PER_USER_BYTES) {
-    return json({ error: "သိုလှောင်ခန့် ပြည့်သွားပါပြီ။" }, 413);
-  }
 
   const id = randId();
   const key = `users/${username}/files/${id}`;
@@ -780,12 +914,8 @@ async function apiRemote(request, env, username) {
   const head = await env.R2.head(key);
   const realSize = head ? head.size : declared;
   if (realSize > MAX_REMOTE_BYTES) {
-    await env.R2.delete(key);
+    await env.R2.delete(key).catch(() => {});
     return json({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
-  }
-  if ((meta.totalBytes || 0) + realSize > PER_USER_BYTES) {
-    await env.R2.delete(key);
-    return json({ error: "သိုလှောင်ခန့် ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
   }
 
   let fname = name;
@@ -807,11 +937,22 @@ async function apiRemote(request, env, username) {
   }
   fname = cleanName(fname, id);
 
-  meta.files = meta.files || {};
-  meta.files[id] = { name: fname, size: realSize, type: ctype, uploadedAt: nowMM(), folder: folder || "", key };
-  meta.totalBytes = (meta.totalBytes || 0) + realSize;
-  await saveMeta(env, username, meta);
-  return json({ ok: true, id });
+  const out = await updateMeta(env, username, (meta) => {
+    if (folder && !meta.folders[folder]) {
+      return metaAbort(json({ error: "Folder မတွေ့ပါ", __cleanup: true }, 400));
+    }
+    if ((meta.totalBytes || 0) + realSize > PER_USER_BYTES) {
+      return metaAbort(json({ error: "သိုလှောင်ခန့် ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။", __cleanup: true }, 413));
+    }
+    meta.files = meta.files || {};
+    meta.files[id] = { name: fname, size: realSize, type: ctype, uploadedAt: nowMM(), folder: folder || "", key };
+    meta.totalBytes = (meta.totalBytes || 0) + realSize;
+    return metaCommit(json({ ok: true, id }));
+  });
+  if (out.status === 413 || out.status === 400) {
+    await env.R2.delete(key).catch(() => {});
+  }
+  return out;
 }
 
 function extFromType(ctype) {
@@ -829,68 +970,79 @@ function extFromType(ctype) {
 }
 
 async function apiDelete(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id } = body;
-  const f = meta.files?.[id];
-  if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
-  await env.R2.delete(f.key);
-  // share index ပါ ဖျက်
-  if (f.share?.token) {
-    await env.R2.delete(shareKey(f.share.token));
+  let toDeleteKey = null, shareTok = null;
+
+  const out = await updateMeta(env, username, (meta) => {
+    const f = meta.files?.[id];
+    if (!f) return metaAbort(json({ error: "ဖိုင်မတွေ့ပါ" }, 404));
+    toDeleteKey = f.key;
+    shareTok = f.share?.token || null;
+    meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
+    delete meta.files[id];
+    return metaCommit(json({ ok: true }));
+  });
+  // meta အောင်မြင်ပြီးမှ R2 file ဖျက် (side-effect after commit)
+  if (out.status === 200 && toDeleteKey) {
+    await env.R2.delete(toDeleteKey).catch(() => {});
+    if (shareTok) await env.R2.delete(shareKey(shareTok)).catch(() => {});
   }
-  meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
-  delete meta.files[id];
-  await saveMeta(env, username, meta);
-  return json({ ok: true });
+  return out;
 }
 
 async function apiRename(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   let { id, name } = body;
-  const f = meta.files?.[id];
-  if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
-  name = cleanName(name, "");
-  if (!name) return json({ error: "နာမည် ထည့်ပါ" }, 400);
-  if (!/\.[a-z0-9]{1,8}$/i.test(name)) {
-    const oldExt = (f.name.match(/\.[a-z0-9]{1,8}$/i) || [""])[0];
-    if (oldExt) name += oldExt;
-  }
-  f.name = name;
-  await saveMeta(env, username, meta);
-  return json({ ok: true, name });
+  return await updateMeta(env, username, (meta) => {
+    const f = meta.files?.[id];
+    if (!f) return metaAbort(json({ error: "ဖိုင်မတွေ့ပါ" }, 404));
+    let nm = cleanName(name, "");
+    if (!nm) return metaAbort(json({ error: "နာမည် ထည့်ပါ" }, 400));
+    if (!/\.[a-z0-9]{1,8}$/i.test(nm)) {
+      const oldExt = (f.name.match(/\.[a-z0-9]{1,8}$/i) || [""])[0];
+      if (oldExt) nm += oldExt;
+    }
+    f.name = nm;
+    return metaCommit(json({ ok: true, name: nm }));
+  });
 }
 
 async function apiShare(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id, duration } = body;
-  const f = meta.files?.[id];
-  if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
+  let oldShareToDelete = null, shareIndexToWrite = null;
 
-  if (duration === "off") {
-    if (f.share?.token) await env.R2.delete(shareKey(f.share.token));
-    delete f.share;
-    await saveMeta(env, username, meta);
-    return json({ ok: true, share: null });
+  const out = await updateMeta(env, username, (meta) => {
+    const f = meta.files?.[id];
+    if (!f) return metaAbort(json({ error: "ဖိုင်မတွေ့ပါ" }, 404));
+
+    if (duration === "off") {
+      if (f.share?.token) oldShareToDelete = f.share.token;
+      delete f.share;
+      return metaCommit(json({ ok: true, share: null }));
+    }
+    const map = { "2d": 2 * 86400e3, "1w": 7 * 86400e3, "1m": 30 * 86400e3, "1y": 365 * 86400e3 };
+    let expiresAt = null;
+    if (duration !== "lifetime") {
+      const ms = map[duration];
+      if (!ms) return metaAbort(json({ error: "သက်တမ်းမှားနေပါသည်" }, 400));
+      expiresAt = Date.now() + ms;
+    }
+    const token = f.share?.token || randId();
+    f.share = { token, expiresAt };
+    shareIndexToWrite = { token, fileId: id };
+    return metaCommit(json({ ok: true, share: { token, expiresAt, name: f.name } }));
+  });
+
+  // commit ပြီးမှ share index R2 write/delete
+  if (out.status === 200) {
+    if (shareIndexToWrite) await saveShareIndex(env, shareIndexToWrite.token, username, shareIndexToWrite.fileId);
+    if (oldShareToDelete) await env.R2.delete(shareKey(oldShareToDelete)).catch(() => {});
   }
-  const map = { "2d": 2 * 86400e3, "1w": 7 * 86400e3, "1m": 30 * 86400e3, "1y": 365 * 86400e3 };
-  let expiresAt = null;
-  if (duration !== "lifetime") {
-    const ms = map[duration];
-    if (!ms) return json({ error: "သက်တမ်းမှားနေပါသည်" }, 400);
-    expiresAt = Date.now() + ms;
-  }
-  // token ကို အမြဲ unique ထုတ်ပေး (ဖိုင်တစ်ခုစီ မတူအောင်)
-  const token = f.share?.token || randId();
-  f.share = { token, expiresAt };
-  await saveShareIndex(env, token, username, id);
-  await saveMeta(env, username, meta);
-  return json({ ok: true, share: { token, expiresAt, name: f.name } });
+  return out;
 }
 
-// share token → {username, fileId} mapping
 function shareKey(token) { return `__shares__/${token}.json`; }
 async function saveShareIndex(env, token, username, fileId) {
   await env.R2.put(shareKey(token), JSON.stringify({ username, fileId }), {
@@ -946,89 +1098,98 @@ async function handleShare(request, env, token, nameSeg) {
   if (target.share.expiresAt && Date.now() > target.share.expiresAt) {
     return new Response("ဤ link သက်တမ်းကုန်သွားပါပြီ။ (မူရင်းဖိုင်မပျက်ပါ)", { status: 410 });
   }
-  // strict mode: filename mismatch ဆိုရင် ပယ်
   if (STRICT_SHARE_FILENAME && nameSeg) {
     const want = target.name;
     if (decodeURIComponent(nameSeg) !== want && nameSeg !== encodeURIComponent(want)) {
       return new Response("Link မတွေ့ပါ", { status: 404 });
     }
   }
-  // token-based unique cache key — ဖိုင်ချင်း cache မရောအောင်
   return await serveObject(request, env, target, {
     inlineDefault: true,
     cacheControl: "public, max-age=300, must-revalidate",
   });
 }
 
-// ======================= Folder Handlers (per-user) =======================
+// ======================= Folder Handlers (CAS-safe) =======================
 async function apiFolderCreate(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   let { name, parent } = body;
   name = (name || "").toString().trim();
   parent = (parent || "").toString();
   if (!name) return json({ error: "Folder နာမည် ထည့်ပါ" }, 400);
   if (name.length > 80) return json({ error: "နာမည် ရှည်လွန်းနေပါသည်" }, 400);
-  if (parent && !meta.folders[parent]) return json({ error: "Parent folder မတွေ့ပါ" }, 400);
-  const dup = Object.values(meta.folders).some(
-    fd => (fd.parent || "") === parent && fd.name.toLowerCase() === name.toLowerCase()
-  );
-  if (dup) return json({ error: "ဤနာမည်ဖြင့် folder ရှိပြီးသားပါ" }, 400);
+
   const id = randId();
-  meta.folders[id] = { name, parent, createdAt: nowMM() };
-  await saveMeta(env, username, meta);
-  return json({ ok: true, id });
+  return await updateMeta(env, username, (meta) => {
+    if (parent && !meta.folders[parent]) return metaAbort(json({ error: "Parent folder မတွေ့ပါ" }, 400));
+    const dup = Object.values(meta.folders).some(
+      fd => (fd.parent || "") === parent && fd.name.toLowerCase() === name.toLowerCase()
+    );
+    if (dup) return metaAbort(json({ error: "ဤနာမည်ဖြင့် folder ရှိပြီးသားပါ" }, 400));
+    meta.folders[id] = { name, parent, createdAt: nowMM() };
+    return metaCommit(json({ ok: true, id }));
+  });
 }
 
 async function apiFolderRename(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   let { id, name } = body;
   name = (name || "").toString().trim();
-  const fd = meta.folders?.[id];
-  if (!fd) return json({ error: "Folder မတွေ့ပါ" }, 404);
-  if (!name) return json({ error: "နာမည် ထည့်ပါ" }, 400);
-  fd.name = name;
-  await saveMeta(env, username, meta);
-  return json({ ok: true });
+  return await updateMeta(env, username, (meta) => {
+    const fd = meta.folders?.[id];
+    if (!fd) return metaAbort(json({ error: "Folder မတွေ့ပါ" }, 404));
+    if (!name) return metaAbort(json({ error: "နာမည် ထည့်ပါ" }, 400));
+    fd.name = name;
+    return metaCommit(json({ ok: true }));
+  });
 }
 
 async function apiFolderDelete(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id } = body;
-  if (!meta.folders?.[id]) return json({ error: "Folder မတွေ့ပါ" }, 404);
-  const toDelete = new Set([id]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const [fid, fd] of Object.entries(meta.folders)) {
-      if (!toDelete.has(fid) && toDelete.has(fd.parent || "")) { toDelete.add(fid); changed = true; }
+  let keysToDelete = [];
+
+  const out = await updateMeta(env, username, (meta) => {
+    if (!meta.folders?.[id]) return metaAbort(json({ error: "Folder မတွေ့ပါ" }, 404));
+    const toDelete = new Set([id]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const [fid, fd] of Object.entries(meta.folders)) {
+        if (!toDelete.has(fid) && toDelete.has(fd.parent || "")) { toDelete.add(fid); changed = true; }
+      }
+    }
+    keysToDelete = [];
+    for (const [fileId, f] of Object.entries(meta.files)) {
+      if (toDelete.has(f.folder || "")) {
+        keysToDelete.push({ key: f.key, shareTok: f.share?.token || null });
+        meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
+        delete meta.files[fileId];
+      }
+    }
+    for (const fid of toDelete) delete meta.folders[fid];
+    return metaCommit(json({ ok: true }));
+  });
+
+  if (out.status === 200) {
+    for (const k of keysToDelete) {
+      await env.R2.delete(k.key).catch(() => {});
+      if (k.shareTok) await env.R2.delete(shareKey(k.shareTok)).catch(() => {});
     }
   }
-  for (const [fileId, f] of Object.entries(meta.files)) {
-    if (toDelete.has(f.folder || "")) {
-      await env.R2.delete(f.key);
-      if (f.share?.token) await env.R2.delete(shareKey(f.share.token));
-      meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
-      delete meta.files[fileId];
-    }
-  }
-  for (const fid of toDelete) delete meta.folders[fid];
-  await saveMeta(env, username, meta);
-  return json({ ok: true });
+  return out;
 }
 
 async function apiMove(request, env, username) {
-  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id, folder } = body;
-  const f = meta.files?.[id];
-  if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
-  if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
-  f.folder = folder || "";
-  await saveMeta(env, username, meta);
-  return json({ ok: true });
+  return await updateMeta(env, username, (meta) => {
+    const f = meta.files?.[id];
+    if (!f) return metaAbort(json({ error: "ဖိုင်မတွေ့ပါ" }, 404));
+    if (folder && !meta.folders[folder]) return metaAbort(json({ error: "Folder မတွေ့ပါ" }, 400));
+    f.folder = folder || "";
+    return metaCommit(json({ ok: true }));
+  });
 }
 
 // ======================= HTML Pages =======================
@@ -1384,7 +1545,7 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 
 <div class="modal" id="renameModal"><div class="box">
 <h3>✏️ နာမည်ပြောင်းရန်</h3>
-<input type="text" id="renameInput" placeholder="ဖိုင်နာမည် အသစ်" maxlength="200">
+<input type="text" id="renameInput" placeholder="အသစ်နာမည်" maxlength="200">
 <button onclick="doRename()" style="width:100%;margin-top:10px">✅ ပြောင်းမည်</button>
 <div id="renameErr" style="color:#d33;font-size:13px;margin-top:8px"></div>
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('renameModal')">ပိတ်မည်</button>
@@ -1418,7 +1579,7 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <div class="toast" id="toast"></div>
 
 <script>
-let currentFolder="",currentShareId=null,currentMoveId=null,currentRenameId=null;
+let currentFolder="",currentShareId=null,currentMoveId=null,currentRenameId=null,currentRenameFolderId=null;
 let allFolders=[],currentPage=1;const PAGE_SIZE=12;let lastFiles=[],_confirmCb=null;
 const MAX_PARALLEL=3;
 const DIRECT_LIMIT=90*1024*1024;
@@ -1429,7 +1590,79 @@ function openModal(id){document.getElementById(id).classList.add('show');}
 function closeModal(id){document.getElementById(id).classList.remove('show');}
 function fileIcon(t){t=t||'';if(t.startsWith('video/'))return'🎬';if(t.startsWith('image/'))return'🖼️';if(t.startsWith('audio/'))return'🎵';if(t.startsWith('text/'))return'📄';if(t.includes('pdf'))return'📕';if(t.includes('zip')||t.includes('rar'))return'🗜️';return'📦';}
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function escapeJs(s){return String(s).replace(/['\\\\]/g,'\\\\$&').replace(/"/g,'&quot;');}
+
+// === event delegation (inline onclick string-escape bug ဖယ်) ===
+function renderFiles(){
+  const list=document.getElementById('list'),pager=document.getElementById('pager');
+  const q=(document.getElementById('searchBox').value||'').toLowerCase().trim();
+  let arr=lastFiles;
+  if(q)arr=lastFiles.filter(f=>f.name.toLowerCase().includes(q));
+  const total=arr.length;
+  if(!total){list.innerHTML='<div class="empty"><div class="big">🗂️</div>'+(q?'ရှာဖွေမှု မတွေ့ပါ။':'ဤနေရာတွင် ဖိုင်မရှိသေးပါ။')+'</div>';pager.innerHTML='';return;}
+  const pages=Math.ceil(total/PAGE_SIZE);
+  if(currentPage>pages)currentPage=pages;if(currentPage<1)currentPage=1;
+  const start=(currentPage-1)*PAGE_SIZE,slice=arr.slice(start,start+PAGE_SIZE);
+  list.innerHTML=slice.map(f=>{
+    let shareTag='';
+    if(f.share){const exp=f.share.expiresAt;
+      if(exp&&Date.now()>exp)shareTag='<span class="tag exp">Link ကုန်</span>';
+      else if(exp)shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
+      else shareTag='<span class="tag life">♾️ Lifetime</span>';}
+    const shareTok=f.share?f.share.token:'';
+    return '<div class="file" data-id="'+f.id+'" data-type="'+escapeHtml(f.type||'')+'" data-name="'+escapeHtml(f.name)+'" data-share="'+shareTok+'">'+
+      '<div class="top"><div style="display:flex;gap:11px">'+
+      '<div class="ficon" data-act="view" title="ကြည့်ရန်">'+fileIcon(f.type)+'</div><div>'+
+      '<div class="fname" data-act="view" title="ကြည့်ရန်">'+escapeHtml(f.name)+'</div>'+shareTag+
+      '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type||'')+'<br>🕒 '+escapeHtml(f.uploadedAt||'')+' (မြန်မာစံတော်ချိန်)</div>'+
+      '</div></div></div><div class="acts">'+
+      '<button class="sec" data-act="view">👁 ကြည့်</button>'+
+      '<button data-act="dl">⬇ Download</button>'+
+      '<button class="sec" data-act="rename">✏️ Rename</button>'+
+      (f.share?'<button class="sec" data-act="copylink">📋 Link</button>':'')+
+      '<button class="sec" data-act="share">🔗 Share</button>'+
+      '<button class="sec" data-act="move">📦 ရွှေ့</button>'+
+      '<button class="danger" data-act="del">🗑 ဖျက်</button>'+
+      '</div></div>';
+  }).join('');
+  if(pages<=1){pager.innerHTML='';return;}
+  let p='<button class="sec" '+(currentPage<=1?'disabled':'')+' data-page="'+(currentPage-1)+'">‹ နောက်သို့</button>';
+  p+='<span class="pinfo">စာမျက်နှာ '+currentPage+' / '+pages+'</span>';
+  p+='<button class="sec" '+(currentPage>=pages?'disabled':'')+' data-page="'+(currentPage+1)+'">ရှေ့သို့ ›</button>';
+  pager.innerHTML=p;
+}
+
+// file list click delegation
+document.getElementById('list').addEventListener('click',e=>{
+  const btn=e.target.closest('[data-act]');if(!btn)return;
+  const card=e.target.closest('.file');if(!card)return;
+  const id=card.dataset.id,name=card.dataset.name,type=card.dataset.type,share=card.dataset.share;
+  const act=btn.dataset.act;
+  if(act==='view')openPreview(id,name,type);
+  else if(act==='dl')dl(id);
+  else if(act==='rename')openRename(id,name);
+  else if(act==='share')openShare(id);
+  else if(act==='move')openMove(id);
+  else if(act==='del')del(id,name);
+  else if(act==='copylink'&&share)copyShare(share,name);
+});
+document.getElementById('pager').addEventListener('click',e=>{
+  const b=e.target.closest('[data-page]');if(!b)return;
+  gotoPage(Number(b.dataset.page));
+});
+
+// folder grid click delegation
+document.getElementById('folders').addEventListener('click',e=>{
+  const fbtn=e.target.closest('[data-fact]');
+  const card=e.target.closest('.fold');if(!card)return;
+  const id=card.dataset.id,name=card.dataset.name;
+  if(fbtn){
+    e.stopPropagation();
+    if(fbtn.dataset.fact==='ren')openRenameFolder(id,name);
+    else if(fbtn.dataset.fact==='del')delFolder(id,name);
+    return;
+  }
+  goFolder(id);
+});
 
 function confirmBox({title,text,okText='အတည်ပြုမည်',danger=true}){
   return new Promise(res=>{_confirmCb=res;
@@ -1502,60 +1735,25 @@ async function load(){
   document.getElementById('statFolders').textContent=d.folders.length;
   document.getElementById('statFree').textContent=fmtSize(Math.max(0,d.maxBytes-d.totalBytes));
 
-  let cb='<a onclick="goFolder(\\'\\')">🏠 Home</a>';
-  for(const b of d.breadcrumb)cb+='<span class="sep">›</span><a onclick="goFolder(\\''+b.id+'\\')">'+escapeHtml(b.name)+'</a>';
-  document.getElementById('crumb').innerHTML=cb;
+  let cb='<a data-home="1">🏠 Home</a>';
+  for(const b of d.breadcrumb)cb+='<span class="sep">›</span><a data-fid="'+b.id+'">'+escapeHtml(b.name)+'</a>';
+  const crumb=document.getElementById('crumb');crumb.innerHTML=cb;
+  crumb.onclick=e=>{const a=e.target.closest('a');if(!a)return;
+    if(a.dataset.home)goFolder('');else if(a.dataset.fid!==undefined)goFolder(a.dataset.fid);};
 
   const fg=document.getElementById('folders');
   if(!d.folders.length)fg.innerHTML='<div style="color:#94a3b8;font-size:13px;grid-column:1/-1">Folder မရှိသေးပါ။</div>';
   else fg.innerHTML=d.folders.map(fd=>
-    '<div class="fold" onclick="goFolder(\\''+fd.id+'\\')">'+
+    '<div class="fold" data-id="'+fd.id+'" data-name="'+escapeHtml(fd.name)+'">'+
     '<div class="fbtns">'+
-    '<button class="ren" title="နာမည်ပြောင်း" onclick="event.stopPropagation();renameFolder(\\''+fd.id+'\\',\\''+escapeJs(fd.name)+'\\')">✏️</button>'+
-    '<button class="del" title="ဖျက်" onclick="event.stopPropagation();delFolder(\\''+fd.id+'\\',\\''+escapeJs(fd.name)+'\\')">🗑</button></div>'+
+    '<button class="ren" data-fact="ren" title="နာမည်ပြောင်း">✏️</button>'+
+    '<button class="del" data-fact="del" title="ဖျက်">🗑</button></div>'+
     '<div class="ico">📁</div><div class="nm">'+escapeHtml(fd.name)+'</div><div class="ct">'+fd.count+' items</div></div>'
   ).join('');
 
   lastFiles=d.files;renderFiles();
 }
 
-function renderFiles(){
-  const list=document.getElementById('list'),pager=document.getElementById('pager');
-  const q=(document.getElementById('searchBox').value||'').toLowerCase().trim();
-  let arr=lastFiles;
-  if(q)arr=lastFiles.filter(f=>f.name.toLowerCase().includes(q));
-  const total=arr.length;
-  if(!total){list.innerHTML='<div class="empty"><div class="big">🗂️</div>'+(q?'ရှာဖွေမှု မတွေ့ပါ။':'ဤနေရာတွင် ဖိုင်မရှိသေးပါ။')+'</div>';pager.innerHTML='';return;}
-  const pages=Math.ceil(total/PAGE_SIZE);
-  if(currentPage>pages)currentPage=pages;if(currentPage<1)currentPage=1;
-  const start=(currentPage-1)*PAGE_SIZE,slice=arr.slice(start,start+PAGE_SIZE);
-  list.innerHTML=slice.map(f=>{
-    let shareTag='';
-    if(f.share){const exp=f.share.expiresAt;
-      if(exp&&Date.now()>exp)shareTag='<span class="tag exp">Link ကုန်</span>';
-      else if(exp)shareTag='<span class="tag">'+new Date(exp).toLocaleDateString('my-MM')+' ထိ</span>';
-      else shareTag='<span class="tag life">♾️ Lifetime</span>';}
-    const tEsc=escapeJs(f.type||''),nEsc=escapeJs(f.name);
-    return '<div class="file"><div class="top"><div style="display:flex;gap:11px">'+
-      '<div class="ficon" title="ကြည့်ရန်" onclick="openPreview(\\''+f.id+'\\',\\''+nEsc+'\\',\\''+tEsc+'\\')">'+fileIcon(f.type)+'</div><div>'+
-      '<div class="fname" title="ကြည့်ရန်" onclick="openPreview(\\''+f.id+'\\',\\''+nEsc+'\\',\\''+tEsc+'\\')">'+escapeHtml(f.name)+'</div>'+shareTag+
-      '<div class="meta">'+fmtSize(f.size)+' • '+escapeHtml(f.type||'')+'<br>🕒 '+escapeHtml(f.uploadedAt||'')+' (မြန်မာစံတော်ချိန်)</div>'+
-      '</div></div></div><div class="acts">'+
-      '<button class="sec" onclick="openPreview(\\''+f.id+'\\',\\''+nEsc+'\\',\\''+tEsc+'\\')">👁 ကြည့်</button>'+
-      '<button onclick="dl(\\''+f.id+'\\')">⬇ Download</button>'+
-      '<button class="sec" onclick="openRename(\\''+f.id+'\\',\\''+nEsc+'\\')">✏️ Rename</button>'+
-      (f.share?'<button class="sec" onclick="copyShare(\\''+f.share.token+'\\',\\''+nEsc+'\\')">📋 Link</button>':'')+
-      '<button class="sec" onclick="openShare(\\''+f.id+'\\')">🔗 Share</button>'+
-      '<button class="sec" onclick="openMove(\\''+f.id+'\\')">📦 ရွှေ့</button>'+
-      '<button class="danger" onclick="del(\\''+f.id+'\\',\\''+nEsc+'\\')">🗑 ဖျက်</button>'+
-      '</div></div>';
-  }).join('');
-  if(pages<=1){pager.innerHTML='';return;}
-  let p='<button class="sec" '+(currentPage<=1?'disabled':'')+' onclick="gotoPage('+(currentPage-1)+')">‹ နောက်သို့</button>';
-  p+='<span class="pinfo">စာမျက်နှာ '+currentPage+' / '+pages+'</span>';
-  p+='<button class="sec" '+(currentPage>=pages?'disabled':'')+' onclick="gotoPage('+(currentPage+1)+')">ရှေ့သို့ ›</button>';
-  pager.innerHTML=p;
-}
 function gotoPage(p){currentPage=p;renderFiles();window.scrollTo({top:document.getElementById('list').offsetTop-80,behavior:'smooth'});}
 function goFolder(id){setRoute(id,true);}
 function dl(id){window.open('/api/download?id='+encodeURIComponent(id),'_blank');}
@@ -1588,11 +1786,29 @@ async function doCreateFolder(){
   if(r.ok){toast('📁 Folder ဆောက်ပြီးပါပြီ');closeModal('folderModal');load();}
   else document.getElementById('folderErr').textContent=d.error||'မရပါ';
 }
-async function renameFolder(id,name){
-  const nn=prompt('Folder နာမည် အသစ်:',name);if(nn==null)return;const t=nn.trim();if(!t)return;
-  const r=await fetch('/api/folder/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name:t})});
-  const d=await r.json();if(r.ok){toast('✏️ Folder နာမည်ပြောင်းပြီး');load();}else toast(d.error||'မရပါ');
-}
+
+// folder rename — modal သုံး (prompt() ဖယ်)
+function openRenameFolder(id,name){currentRenameFolderId=id;currentRenameId=null;
+  document.getElementById('renameErr').textContent='';
+  document.getElementById('renameInput').value=name;
+  document.querySelector('#renameModal h3').textContent='✏️ Folder နာမည်ပြောင်းရန်';
+  openModal('renameModal');setTimeout(()=>document.getElementById('renameInput').focus(),100);}
+// doRename ကို file/folder နှစ်မျိုးလုံး ဆောင်ရွက်အောင် override
+const _origDoRename=doRename;
+doRename=async function(){
+  const name=document.getElementById('renameInput').value.trim();
+  if(!name){document.getElementById('renameErr').textContent='နာမည်ထည့်ပါ';return;}
+  if(currentRenameFolderId){
+    const r=await fetch('/api/folder/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentRenameFolderId,name})});
+    const d=await r.json();
+    if(r.ok){toast('✏️ Folder နာမည်ပြောင်းပြီး');closeModal('renameModal');currentRenameFolderId=null;
+      document.querySelector('#renameModal h3').textContent='✏️ နာမည်ပြောင်းရန်';load();}
+    else document.getElementById('renameErr').textContent=d.error||'မရပါ';
+    return;
+  }
+  await _origDoRename();
+};
+
 async function delFolder(id,name){
   const ok=await confirmBox({title:'Folder ဖျက်မည်',text:'"'+name+'" နှင့် အထဲက ဖိုင်အားလုံး ဖျက်မှာ သေချာလား?',okText:'🗑 ဖျက်မည်'});
   if(!ok)return;
@@ -1694,7 +1910,9 @@ async function doShare(){
   const r=await fetch('/api/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:currentShareId,duration:dur})});
   const d=await r.json();if(!r.ok){toast(d.error||'မရပါ');return;}
   if(d.share){const link=buildShareLink(d.share.token,d.share.name);
-    document.getElementById('shareResult').innerHTML='<b>🔗 Link:</b><br>'+escapeHtml(link)+'<br><button style="margin-top:8px" onclick="copyText(\\''+escapeJs(link)+'\\')">📋 Copy</button>';
+    const sr=document.getElementById('shareResult');
+    sr.innerHTML='<b>🔗 Link:</b><br>'+escapeHtml(link)+'<br><button id="copyBtn" style="margin-top:8px">📋 Copy</button>';
+    document.getElementById('copyBtn').onclick=()=>copyText(link);
     toast('✅ Share link ဖန်တီးပြီးပါပြီ');}
   else{document.getElementById('shareResult').textContent='🚫 Link ပိတ်လိုက်ပါပြီ။';toast('Link ပိတ်ပြီး');}
   load();
