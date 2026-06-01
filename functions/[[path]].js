@@ -751,6 +751,7 @@ async function apiList(request, env, username) {
     totalBytes: meta.totalBytes || 0, maxBytes: PER_USER_BYTES,
   });
 }
+
 async function apiUpload(request, env, username) {
   const form = await request.formData();
   const file = form.get("file");
