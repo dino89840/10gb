@@ -1,17 +1,25 @@
 // ======================= Lugyi Cloud =======================
 // Cloudflare Pages Functions + Object Storage (single-file)
-// Multi-user • Self register • Per-user isolation
+// Multi-user • Invite-code register • Per-user isolation
 // PBKDF2 password hashing • 5-day session • Upload progress
 // ==========================================================
 
-const PER_USER_BYTES = 2 * 1024 * 1024 * 1024;            // user တစ်ယောက် 2 GB
+const PER_USER_BYTES = 10 * 1024 * 1024 * 1024;          // user တစ်ယောက် 10 GB
 const MAX_REMOTE_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024); // 1.5 GB remote url
 const LOCK_KEY = "__meta__/loginlock.json";              // login attempt lock
+const REGLOCK_KEY = "__meta__/reglock.json";             // registration ip lock
+const INVITE_KEY = "__meta__/invites.json";              // invite codes store
 const SESSION_DAYS = 5;                                   // auto logout after 5 days
 const SESSION_MS = SESSION_DAYS * 24 * 60 * 60 * 1000;
 const MAX_PARALLEL_UPLOAD = 3;
 const PBKDF2_ITER = 100000;
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+
+// ---- Abuse-prevention settings (no mail / no OTP) ----
+const REQUIRE_INVITE = false;          // true ဆိုရင် register လုပ်ဖို့ invite code လို
+const MAX_REG_PER_IP_PER_DAY = 2;     // IP တစ်ခုကနေ နေ့တစ်ရက် အကောင့်အများဆုံး
+const MAX_TOTAL_USERS = 500;          // စုစုပေါင်း အကောင့် cap (0 ဆိုရင် ကန့်သတ်မထား)
+const STRICT_SHARE_FILENAME = false;  // true ဆိုရင် /s/{token}/{name} မှာ name မှန်မှ ဖွင့်ပေး
 
 // ---------- Helpers ----------
 const enc = new TextEncoder();
@@ -194,11 +202,53 @@ async function saveLock(env, lock) {
   await env.R2.put(LOCK_KEY, JSON.stringify(lock));
 }
 
+// ---- Registration IP lock (abuse prevention) ----
+async function loadRegLock(env) {
+  const obj = await env.R2.get(REGLOCK_KEY);
+  if (!obj) return {};
+  try { return JSON.parse(await obj.text()); } catch { return {}; }
+}
+async function saveRegLock(env, lock) {
+  await env.R2.put(REGLOCK_KEY, JSON.stringify(lock));
+}
+
+// ---- Invite codes store ----
+// invites.json format: { "CODE123": { used:false, usedBy:null, createdAt:"..." }, ... }
+async function loadInvites(env) {
+  const obj = await env.R2.get(INVITE_KEY);
+  if (!obj) return {};
+  try { return JSON.parse(await obj.text()); } catch { return {}; }
+}
+async function saveInvites(env, inv) {
+  await env.R2.put(INVITE_KEY, JSON.stringify(inv), {
+    httpMetadata: { contentType: "application/json" },
+  });
+}
+
+// ---- total user counter (cheap approximate via meta file) ----
+const USERCOUNT_KEY = "__meta__/usercount.json";
+async function loadUserCount(env) {
+  const obj = await env.R2.get(USERCOUNT_KEY);
+  if (!obj) return 0;
+  try { return JSON.parse(await obj.text()).count || 0; } catch { return 0; }
+}
+async function bumpUserCount(env) {
+  const c = await loadUserCount(env);
+  await env.R2.put(USERCOUNT_KEY, JSON.stringify({ count: c + 1 }));
+  return c + 1;
+}
+
 function nowMM() {
   const d = new Date(Date.now() + (6 * 60 + 30) * 60 * 1000);
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
          `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+function todayKeyMM() {
+  const d = new Date(Date.now() + (6 * 60 + 30) * 60 * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
 }
 
 function randId() {
@@ -280,13 +330,15 @@ function parseRange(rangeHeader, size) {
   return { offset: start, length: end - start + 1, end };
 }
 
-async function serveObject(request, env, f, { inlineDefault = false } = {}) {
+// serveObject — extraCache ဖြင့် share / private cache ခွဲ
+async function serveObject(request, env, f, { inlineDefault = false, cacheControl = "private, max-age=3600" } = {}) {
   const head = await env.R2.head(f.key);
   if (!head) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
   const size = head.size;
   const ctype = f.type || head.httpMetadata?.contentType || "application/octet-stream";
   const inline = inlineDefault && /^(image|video|audio|text)\//.test(ctype);
   const disposition = `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(f.name)}`;
+  const etag = head.httpEtag || `"${f.key}-${size}"`;
 
   const rangeHeader = request.headers.get("Range");
   const range = parseRange(rangeHeader, size);
@@ -310,7 +362,9 @@ async function serveObject(request, env, f, { inlineDefault = false } = {}) {
         "Accept-Ranges": "bytes",
         "Content-Disposition": disposition,
         "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "private, max-age=3600",
+        "Cache-Control": cacheControl,
+        "ETag": etag,
+        "Vary": "Range",
       },
     });
   }
@@ -325,7 +379,8 @@ async function serveObject(request, env, f, { inlineDefault = false } = {}) {
       "Accept-Ranges": "bytes",
       "Content-Disposition": disposition,
       "X-Content-Type-Options": "nosniff",
-      "Cache-Control": "private, max-age=3600",
+      "Cache-Control": cacheControl,
+      "ETag": etag,
     },
   });
 }
@@ -340,8 +395,10 @@ export async function onRequest(context) {
     // ---------- PUBLIC share download (no auth) ----------
     if (path.startsWith("/s/")) {
       const rest = path.slice(3);
-      const token = rest.split("/")[0];
-      return await handleShare(request, env, token);
+      const segs = rest.split("/");
+      const token = segs[0];
+      const nameSeg = segs[1] ? decodeURIComponent(segs.slice(1).join("/")) : null;
+      return await handleShare(request, env, token, nameSeg);
     }
 
     // ---------- Auth APIs (no session needed) ----------
@@ -357,6 +414,11 @@ export async function onRequest(context) {
       return json({ ok: true }, 200, {
         "Set-Cookie": "session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0",
       });
+    }
+
+    // ---------- Admin: invite code generate (protected by ADMIN_KEY) ----------
+    if (path === "/api/admin/invite" && request.method === "POST") {
+      return await handleAdminInvite(request, env);
     }
 
     // ---------- Auth pages ----------
@@ -416,15 +478,43 @@ export async function onRequest(context) {
 async function handleRegister(request, env) {
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const body = await request.json().catch(() => ({}));
-  let { username, password } = body;
+  let { username, password, invite } = body;
   username = String(username || "").trim();
   password = String(password || "");
+  invite = String(invite || "").trim();
 
   if (!USERNAME_RE.test(username)) {
     return json({ error: "Username က စာလုံး ၃-၂၀ လုံး (a-z, 0-9, _) သာ ဖြစ်ရပါမည်။" }, 400);
   }
   if (password.length < 6) {
     return json({ error: "Password အနည်းဆုံး ၆ လုံး ထားပါ။" }, 400);
+  }
+
+  // --- total user cap ---
+  if (MAX_TOTAL_USERS > 0) {
+    const count = await loadUserCount(env);
+    if (count >= MAX_TOTAL_USERS) {
+      return json({ error: "အကောင့်အရေအတွက် ပြည့်သွားပါပြီ။ နောက်မှ ပြန်ကြိုးစားပါ။" }, 403);
+    }
+  }
+
+  // --- IP per-day registration limit ---
+  const regLock = await loadRegLock(env);
+  const dayKey = todayKeyMM();
+  const ipRec = regLock[ip] || { day: dayKey, count: 0 };
+  if (ipRec.day !== dayKey) { ipRec.day = dayKey; ipRec.count = 0; }
+  if (ipRec.count >= MAX_REG_PER_IP_PER_DAY) {
+    return json({ error: "ဤ IP မှ ယနေ့ အကောင့်ဖွင့်ခွင့် ပြည့်သွားပါပြီ။ မနက်ဖြန် ပြန်ကြိုးစားပါ။" }, 429);
+  }
+
+  // --- invite code check ---
+  let invites = null;
+  if (REQUIRE_INVITE) {
+    if (!invite) return json({ error: "Invite code လိုအပ်ပါသည်။" }, 400);
+    invites = await loadInvites(env);
+    const rec = invites[invite];
+    if (!rec) return json({ error: "Invite code မှားနေပါသည်။" }, 400);
+    if (rec.used) return json({ error: "ဤ invite code ကို သုံးပြီးသားဖြစ်ပါသည်။" }, 400);
   }
 
   const existing = await loadUser(env, username);
@@ -438,16 +528,50 @@ async function handleRegister(request, env) {
     displayName: username,
     salt, hash,
     createdAt: nowMM(),
+    regIp: ip,
   };
   await saveUser(env, account);
 
   // empty meta ဖန်တီး
   await saveMeta(env, account.username, { totalBytes: 0, files: {}, folders: {} });
 
+  // --- invite ကို used မှတ် ---
+  if (REQUIRE_INVITE && invites) {
+    invites[invite].used = true;
+    invites[invite].usedBy = account.username;
+    invites[invite].usedAt = nowMM();
+    await saveInvites(env, invites);
+  }
+
+  // --- counters bump ---
+  ipRec.count += 1;
+  regLock[ip] = ipRec;
+  await saveRegLock(env, regLock);
+  await bumpUserCount(env);
+
   const tok = await makeToken(env, account.username);
   return json({ ok: true }, 200, {
     "Set-Cookie": `session=${tok}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(SESSION_MS / 1000)}`,
   });
+}
+
+// Admin invite generate — header  x-admin-key: <ADMIN_KEY>
+async function handleAdminInvite(request, env) {
+  const key = request.headers.get("x-admin-key") || "";
+  if (!env.ADMIN_KEY || !safeEqual(key, env.ADMIN_KEY)) {
+    return json({ error: "forbidden" }, 403);
+  }
+  const body = await request.json().catch(() => ({}));
+  const n = Math.min(50, Math.max(1, Number(body.count) || 1));
+  const invites = await loadInvites(env);
+  const created = [];
+  for (let i = 0; i < n; i++) {
+    const code = randId().slice(0, 10).toUpperCase();
+    invites[code] = { used: false, usedBy: null, createdAt: nowMM() };
+    created.push(code);
+  }
+  await saveInvites(env, invites);
+  return json({ ok: true, codes: created });
 }
 
 async function handleLogin(request, env) {
@@ -470,7 +594,6 @@ async function handleLogin(request, env) {
   if (account) {
     ok = await verifyPassword(password, account.salt, account.hash);
   } else {
-    // user မရှိရင်လည်း timing flatten အတွက် dummy hash တွက်
     await hashPassword(password, "00000000000000000000000000000000");
   }
 
@@ -597,7 +720,6 @@ async function apiFinalize(request, env, username) {
   const { id, key, name, type, folder } = body;
   if (!id || !key) return json({ error: "id/key မပါပါ" }, 400);
   if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
-  // key spoof guard: ဒီ user ရဲ့ prefix နဲ့ pattern မှ ခွင့်ပြု
   if (key !== `users/${username}/files/${id}` || !/^[a-f0-9]{32}$/.test(id)) {
     return json({ error: "invalid key" }, 400);
   }
@@ -713,6 +835,10 @@ async function apiDelete(request, env, username) {
   const f = meta.files?.[id];
   if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
   await env.R2.delete(f.key);
+  // share index ပါ ဖျက်
+  if (f.share?.token) {
+    await env.R2.delete(shareKey(f.share.token));
+  }
   meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
   delete meta.files[id];
   await saveMeta(env, username, meta);
@@ -744,6 +870,7 @@ async function apiShare(request, env, username) {
   if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
 
   if (duration === "off") {
+    if (f.share?.token) await env.R2.delete(shareKey(f.share.token));
     delete f.share;
     await saveMeta(env, username, meta);
     return json({ ok: true, share: null });
@@ -755,8 +882,8 @@ async function apiShare(request, env, username) {
     if (!ms) return json({ error: "သက်တမ်းမှားနေပါသည်" }, 400);
     expiresAt = Date.now() + ms;
   }
+  // token ကို အမြဲ unique ထုတ်ပေး (ဖိုင်တစ်ခုစီ မတူအောင်)
   const token = f.share?.token || randId();
-  // share token ထဲ owner ကို မှတ်ထား (handleShare မှာ ရှာရလွယ်စေရန်)
   f.share = { token, expiresAt };
   await saveShareIndex(env, token, username, id);
   await saveMeta(env, username, meta);
@@ -808,7 +935,7 @@ async function apiView(request, env, username) {
   return await serveObject(request, env, f, { inlineDefault: true });
 }
 
-async function handleShare(request, env, token) {
+async function handleShare(request, env, token, nameSeg) {
   const idx = await loadShareIndex(env, token);
   if (!idx) return new Response("Link မတွေ့ပါ", { status: 404 });
   const meta = await loadMeta(env, idx.username);
@@ -819,7 +946,18 @@ async function handleShare(request, env, token) {
   if (target.share.expiresAt && Date.now() > target.share.expiresAt) {
     return new Response("ဤ link သက်တမ်းကုန်သွားပါပြီ။ (မူရင်းဖိုင်မပျက်ပါ)", { status: 410 });
   }
-  return await serveObject(request, env, target, { inlineDefault: true });
+  // strict mode: filename mismatch ဆိုရင် ပယ်
+  if (STRICT_SHARE_FILENAME && nameSeg) {
+    const want = target.name;
+    if (decodeURIComponent(nameSeg) !== want && nameSeg !== encodeURIComponent(want)) {
+      return new Response("Link မတွေ့ပါ", { status: 404 });
+    }
+  }
+  // token-based unique cache key — ဖိုင်ချင်း cache မရောအောင်
+  return await serveObject(request, env, target, {
+    inlineDefault: true,
+    cacheControl: "public, max-age=300, must-revalidate",
+  });
 }
 
 // ======================= Folder Handlers (per-user) =======================
@@ -871,6 +1009,7 @@ async function apiFolderDelete(request, env, username) {
   for (const [fileId, f] of Object.entries(meta.files)) {
     if (toDelete.has(f.folder || "")) {
       await env.R2.delete(f.key);
+      if (f.share?.token) await env.R2.delete(shareKey(f.share.token));
       meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
       delete meta.files[fileId];
     }
@@ -973,9 +1112,11 @@ const REGISTER_HTML = `<!DOCTYPE html>
 <div class="card">
 <div class="logo">✨</div>
 <h1>အကောင့်အသစ်ဖွင့်ရန်</h1>
-<div class="sub">အခမဲ့ Cloud သိုလှောင်ခန့် ရယူပါ</div>
+<div class="sub">Invite code ဖြင့် အကောင့်ဖွင့်ပါ</div>
 <div class="field"><label>အသုံးပြုသူအမည်</label><input id="u" placeholder="username" autocomplete="username">
 <div class="hint">စာလုံး ၃-၂၀ လုံး (a-z, A-Z, 0-9, _)</div></div>
+<div class="field"><label>Invite Code</label><input id="inv" placeholder="INVITE CODE">
+<div class="hint">Admin ထံမှ ရရှိသော code</div></div>
 <div class="field"><label>စကားဝှက်</label><input id="p" type="password" placeholder="••••••" autocomplete="new-password">
 <div class="hint">အနည်းဆုံး ၆ လုံး</div></div>
 <div class="field"><label>စကားဝှက် အတည်ပြုရန်</label><input id="p2" type="password" placeholder="••••••" autocomplete="new-password"></div>
@@ -991,14 +1132,14 @@ async function reg(){
   btn.disabled=true;spin.style.display='block';btnTxt.textContent='ဖွင့်နေသည်...';
   try{
     const r=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({username:u.value,password:p.value})});
+      body:JSON.stringify({username:u.value,password:p.value,invite:document.getElementById('inv').value})});
     const d=await r.json();
     if(r.ok){location.href='/';return;}
     err.textContent=d.error||'အကောင့်မဖွင့်နိုင်ပါ';
   }catch(e){err.textContent='ကွန်ရက် ပြဿနာ';}
   btn.disabled=false;spin.style.display='none';btnTxt.textContent='အကောင့်ဖွင့်မည်';
 }
-['u','p','p2'].forEach((id,i,a)=>document.getElementById(id).addEventListener('keydown',e=>{
+['u','inv','p','p2'].forEach((id,i,a)=>document.getElementById(id).addEventListener('keydown',e=>{
   if(e.key==='Enter'){if(i<a.length-1)document.getElementById(a[i+1]).focus();else reg();}}));
 </script>
 </body></html>`;
@@ -1012,7 +1153,6 @@ const APP_HTML = `<!DOCTYPE html>
 --card:#fff;--bg:#f1f5f9;--ok:#16a34a;--danger:#ef4444}
 *{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',-apple-system,sans-serif}
 body{margin:0;color:var(--ink);min-height:100vh;background:var(--bg)}
-/* ===== Top bar ===== */
 header{position:sticky;top:0;z-index:30;background:#fff;border-bottom:1px solid var(--line);
 padding:12px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .brand{display:flex;align-items:center;gap:11px}
@@ -1038,7 +1178,6 @@ button.ghost:hover{background:#e2e8f0}
 input,select{padding:11px 12px;border:1px solid #dbe1ea;border-radius:11px;font-size:14px;background:#fff;outline:none;transition:.2s;color:var(--ink)}
 input:focus,select:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(79,70,229,.13)}
 .wrap{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
-/* ===== usage card ===== */
 .hero{display:grid;grid-template-columns:1.3fr 1fr;gap:14px;margin-bottom:18px}
 @media(max-width:760px){.hero{grid-template-columns:1fr}}
 .glass{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;
@@ -1056,7 +1195,6 @@ transition:width .6s;border-radius:8px}
 .mini .m{flex:1;min-width:90px;text-align:center;background:#f8fafc;border-radius:13px;padding:11px;border:1px solid var(--line)}
 .mini .m b{font-size:18px;display:block;color:var(--ink)}
 .mini .m span{font-size:11px;color:var(--muted)}
-/* ===== Upload zone ===== */
 .dropzone{border:2px dashed #c7d0de;border-radius:16px;padding:22px;text-align:center;cursor:pointer;
 transition:.2s;background:#f8fafc}
 .dropzone:hover,.dropzone.drag{border-color:var(--brand);background:#eef2ff;transform:translateY(-2px)}
@@ -1077,7 +1215,6 @@ transition:.2s;background:#f8fafc}
 .remote-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .remote-row input{flex:1;min-width:160px}
 .statusline{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--muted);min-height:20px}
-/* breadcrumb */
 .crumb{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:14px;margin:16px 0 12px;
 background:#fff;padding:11px 15px;border-radius:13px;border:1px solid var(--line)}
 .crumb a{color:var(--brand);cursor:pointer;text-decoration:none;font-weight:700}
@@ -1087,7 +1224,6 @@ background:#fff;padding:11px 15px;border-radius:13px;border:1px solid var(--line
 .toolbar .search{flex:1;min-width:160px;position:relative}
 .toolbar .search input{width:100%;padding-left:38px}
 .toolbar .search .si{position:absolute;left:13px;top:50%;transform:translateY(-50%);opacity:.5}
-/* folders grid */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:12px;margin-bottom:18px}
 .fold{background:#fff;border:1px solid var(--line);border-radius:15px;padding:15px;cursor:pointer;
 display:flex;flex-direction:column;gap:5px;transition:.2s;position:relative;overflow:hidden}
@@ -1100,7 +1236,6 @@ display:flex;flex-direction:column;gap:5px;transition:.2s;position:relative;over
 .fold .fbtns button{border:0;border-radius:8px;width:28px;height:28px;font-size:12px;padding:0;box-shadow:none}
 .fold .fbtns .ren{background:#dbeafe;color:#1e40af}
 .fold .fbtns .del{background:#fee2e2;color:#b91c1c}
-/* file rows */
 .file{background:var(--card);border-radius:15px;padding:14px;margin-bottom:11px;
 box-shadow:0 2px 10px rgba(15,23,42,.04);border:1px solid var(--line);transition:.2s}
 .file:hover{box-shadow:0 10px 24px rgba(15,23,42,.08);transform:translateY(-1px)}
