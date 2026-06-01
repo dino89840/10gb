@@ -1,22 +1,22 @@
-// ======================= Fast Lugyi Storage =======================
-// Cloudflare Pages Functions + R2  (single-file backend + HTML)
-// Premium UI v2 • Folders • Video Seek (Range) • Rename • Multi-upload
-// Security hardened • 5-day session • Upload progress
-// ==================================================================
+// ======================= Lugyi Cloud =======================
+// Cloudflare Pages Functions + Object Storage (single-file)
+// Multi-user • Self register • Per-user isolation
+// PBKDF2 password hashing • 5-day session • Upload progress
+// ==========================================================
 
-const MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;        // 10 GB total storage
+const PER_USER_BYTES = 2 * 1024 * 1024 * 1024;            // user တစ်ယောက် 2 GB
 const MAX_REMOTE_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024); // 1.5 GB remote url
-const META_KEY = "__meta__/index.json";                 // file list + total size
-const LOCK_KEY = "__meta__/loginlock.json";             // login attempt lock
-const SESSION_DAYS = 5;                                  // auto logout after 5 days
+const LOCK_KEY = "__meta__/loginlock.json";              // login attempt lock
+const SESSION_DAYS = 5;                                   // auto logout after 5 days
 const SESSION_MS = SESSION_DAYS * 24 * 60 * 60 * 1000;
-const MAX_PARALLEL_UPLOAD = 3;                           // phone multi-upload limit
+const MAX_PARALLEL_UPLOAD = 3;
+const PBKDF2_ITER = 100000;
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 
 // ---------- Helpers ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-// ---- Security headers (applied to HTML pages) ----
 const SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
@@ -50,13 +50,11 @@ function html(body) {
   });
 }
 
-// ---- constant-time string compare (timing-attack safe for password) ----
+// ---- constant-time compare ----
 function safeEqual(a, b) {
   a = String(a || "");
   b = String(b || "");
-  // length leak ကို လျှော့ချရန် hash ပြီး နှိုင်း
   if (a.length !== b.length) {
-    // ဆက်တွက်စေပြီးမှ false ပြန် (timing flatten)
     let diff = 1;
     const max = Math.max(a.length, b.length, 1);
     for (let i = 0; i < max; i++) diff |= (a.charCodeAt(i % a.length || 0) ^ b.charCodeAt(i % b.length || 0));
@@ -65,6 +63,28 @@ function safeEqual(a, b) {
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+// ---- PBKDF2 password hashing ----
+function bufToHex(buf) {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function hexToBuf(hex) {
+  const arr = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < arr.length; i++) arr[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return arr;
+}
+async function hashPassword(password, saltHex) {
+  const salt = saltHex ? hexToBuf(saltHex) : crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: PBKDF2_ITER, hash: "SHA-256" }, key, 256
+  );
+  return { salt: bufToHex(salt), hash: bufToHex(bits) };
+}
+async function verifyPassword(password, saltHex, hashHex) {
+  const { hash } = await hashPassword(password, saltHex);
+  return safeEqual(hash, hashHex);
 }
 
 // ---- HMAC sign / verify (session token) ----
@@ -78,7 +98,7 @@ async function hmac(secret, msg) {
 }
 
 async function makeToken(env, user) {
-  const exp = Date.now() + SESSION_MS;               // 5 days
+  const exp = Date.now() + SESSION_MS;
   const iat = Date.now();
   const payload = `${user}.${exp}.${iat}`;
   const sig = await hmac(env.SESSION_SECRET, payload);
@@ -92,14 +112,12 @@ async function verifyToken(env, token) {
   let payload;
   try { payload = atob(parts[0]); } catch { return null; }
   const expected = await hmac(env.SESSION_SECRET, payload);
-  // constant-time signature compare
   if (!safeEqual(expected, parts[1])) return null;
   const seg = payload.split(".");
   const user = seg[0];
   const expStr = seg[1];
   const iatStr = seg[2];
-  if (!expStr || Date.now() > Number(expStr)) return null;       // hard expiry (5 days)
-  // absolute-age guard: token အသက် 5 ရက်ကျော်ရင် auto invalid
+  if (!expStr || Date.now() > Number(expStr)) return null;
   if (iatStr && Date.now() - Number(iatStr) > SESSION_MS) return null;
   return user;
 }
@@ -110,13 +128,11 @@ function getCookie(request, name) {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
-async function isAuthed(request, env) {
+async function getAuthUser(request, env) {
   const tok = getCookie(request, "session");
-  const user = await verifyToken(env, tok);
-  return !!user;
+  return await verifyToken(env, tok);
 }
 
-// ---- CSRF helper: same-origin enforcement for state-changing API ----
 function sameOrigin(request, url) {
   const origin = request.headers.get("Origin");
   if (origin) {
@@ -124,18 +140,19 @@ function sameOrigin(request, url) {
     catch { return false; }
     return true;
   }
-  // Origin မပါရင် Referer နဲ့ စစ်
   const ref = request.headers.get("Referer");
   if (ref) {
     try { return new URL(ref).host === url.host; } catch { return false; }
   }
-  // header နှစ်ခုလုံး မပါတဲ့ POST ကို ပယ်
   return false;
 }
 
-// ---- Metadata index (file list + folders + total bytes) ----
-async function loadMeta(env) {
-  const obj = await env.R2.get(META_KEY);
+// ---- Per-user metadata ----
+function userMetaKey(username) {
+  return `users/${username}/index.json`;
+}
+async function loadMeta(env, username) {
+  const obj = await env.R2.get(userMetaKey(username));
   if (!obj) return { totalBytes: 0, files: {}, folders: {} };
   try {
     const m = JSON.parse(await obj.text());
@@ -145,8 +162,24 @@ async function loadMeta(env) {
     return m;
   } catch { return { totalBytes: 0, files: {}, folders: {} }; }
 }
-async function saveMeta(env, meta) {
-  await env.R2.put(META_KEY, JSON.stringify(meta), {
+async function saveMeta(env, username, meta) {
+  await env.R2.put(userMetaKey(username), JSON.stringify(meta), {
+    httpMetadata: { contentType: "application/json" },
+  });
+}
+
+// ---- User account store ----
+function userKey(username) {
+  return `users/${username.toLowerCase()}/account.json`;
+}
+async function loadUser(env, username) {
+  if (!username) return null;
+  const obj = await env.R2.get(userKey(username));
+  if (!obj) return null;
+  try { return JSON.parse(await obj.text()); } catch { return null; }
+}
+async function saveUser(env, account) {
+  await env.R2.put(userKey(account.username), JSON.stringify(account), {
     httpMetadata: { contentType: "application/json" },
   });
 }
@@ -162,7 +195,7 @@ async function saveLock(env, lock) {
 }
 
 function nowMM() {
-  const d = new Date(Date.now() + (6 * 60 + 30) * 60 * 1000); // UTC+6:30
+  const d = new Date(Date.now() + (6 * 60 + 30) * 60 * 1000);
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
          `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
@@ -172,12 +205,11 @@ function randId() {
   return crypto.randomUUID().replace(/-/g, "");
 }
 
-// ---- filename sanitize (path traversal / control char block) ----
 function cleanName(name, fallback) {
   let n = String(name == null ? "" : name).trim();
-  n = n.replace(/[\/\\]/g, "_");          // slash ဖယ်
-  n = n.replace(/[\x00-\x1f\x7f]/g, "");  // control char ဖယ်
-  n = n.replace(/^\.+/, "");              // ရှေ့ dot ဖယ် (.htaccess စသဖြင့်)
+  n = n.replace(/[\/\\]/g, "_");
+  n = n.replace(/[\x00-\x1f\x7f]/g, "");
+  n = n.replace(/^\.+/, "");
   if (n.length > 200) {
     const dot = n.lastIndexOf(".");
     const ext = dot > -1 ? n.slice(dot) : "";
@@ -186,7 +218,7 @@ function cleanName(name, fallback) {
   return n || fallback || "file";
 }
 
-// ---- AWS Signature V4 for R2 presigned URL ----
+// ---- AWS Signature V4 for presigned URL (per-user prefixed key) ----
 async function sha256Hex(data) {
   const buf = await crypto.subtle.digest("SHA-256", typeof data === "string" ? enc.encode(data) : data);
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
@@ -195,7 +227,7 @@ async function hmacRaw(key, msg) {
   const k = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
 }
-async function presignR2Put(env, objectKey, expiresSec = 3600) {
+async function presignPut(env, objectKey, expiresSec = 3600) {
   const region = "auto";
   const service = "s3";
   const host = `${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
@@ -231,7 +263,6 @@ async function presignR2Put(env, objectKey, expiresSec = 3600) {
   return `${endpoint}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
-// ---- Range request parser ----
 function parseRange(rangeHeader, size) {
   if (!rangeHeader) return null;
   const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
@@ -249,7 +280,6 @@ function parseRange(rangeHeader, size) {
   return { offset: start, length: end - start + 1, end };
 }
 
-// ---- Stream an R2 object with Range support ----
 async function serveObject(request, env, f, { inlineDefault = false } = {}) {
   const head = await env.R2.head(f.key);
   if (!head) return new Response("ဖိုင်မတွေ့ပါ", { status: 404 });
@@ -314,7 +344,11 @@ export async function onRequest(context) {
       return await handleShare(request, env, token);
     }
 
-    // ---------- Login API ----------
+    // ---------- Auth APIs (no session needed) ----------
+    if (path === "/api/register" && request.method === "POST") {
+      if (!sameOrigin(request, url)) return json({ error: "bad origin" }, 403);
+      return await handleRegister(request, env);
+    }
     if (path === "/api/login" && request.method === "POST") {
       if (!sameOrigin(request, url)) return json({ error: "bad origin" }, 403);
       return await handleLogin(request, env);
@@ -325,50 +359,96 @@ export async function onRequest(context) {
       });
     }
 
-    // ---------- Login page (no auth needed) ----------
+    // ---------- Auth pages ----------
     if (path === "/login") return html(LOGIN_HTML);
+    if (path === "/register") return html(REGISTER_HTML);
 
     // ---------- Everything below needs auth ----------
+    const authedUser = await getAuthUser(request, env);
     if (path.startsWith("/api/")) {
-      if (!(await isAuthed(request, env))) return json({ error: "unauthorized" }, 401);
-      // CSRF: state-changing POST တွေအတွက် same-origin စစ်
+      if (!authedUser) return json({ error: "unauthorized" }, 401);
+      const acct = await loadUser(env, authedUser);
+      if (!acct) return json({ error: "unauthorized" }, 401);
       if (request.method === "POST" && !sameOrigin(request, url)) {
         return json({ error: "bad origin" }, 403);
       }
+      context.user = acct;
     } else {
-      if (!(await isAuthed(request, env))) {
+      if (!authedUser) {
         return Response.redirect(url.origin + "/login", 302);
       }
+      const acct = await loadUser(env, authedUser);
+      if (!acct) return Response.redirect(url.origin + "/login", 302);
+      context.user = acct;
     }
 
-    // ---------- API routes (authed) ----------
-    if (path === "/api/list" && request.method === "GET") return await apiList(request, env);
-    if (path === "/api/upload" && request.method === "POST") return await apiUpload(request, env);
-    if (path === "/api/presign" && request.method === "POST") return await apiPresign(request, env);
-    if (path === "/api/finalize" && request.method === "POST") return await apiFinalize(request, env);
-    if (path === "/api/remote" && request.method === "POST") return await apiRemote(request, env);
-    if (path === "/api/delete" && request.method === "POST") return await apiDelete(request, env);
-    if (path === "/api/rename" && request.method === "POST") return await apiRename(request, env);
-    if (path === "/api/share" && request.method === "POST") return await apiShare(request, env);
-    if (path === "/api/changepass" && request.method === "POST") return await apiChangePass(request, env);
-    if (path === "/api/download" && request.method === "GET") return await apiDownload(request, env);
-    if (path === "/api/view" && request.method === "GET") return await apiView(request, env);
-    if (path === "/api/folder/create" && request.method === "POST") return await apiFolderCreate(request, env);
-    if (path === "/api/folder/delete" && request.method === "POST") return await apiFolderDelete(request, env);
-    if (path === "/api/folder/rename" && request.method === "POST") return await apiFolderRename(request, env);
-    if (path === "/api/move" && request.method === "POST") return await apiMove(request, env);
+    const username = context.user.username;
+
+    // ---------- API routes (authed, per-user) ----------
+    if (path === "/api/me" && request.method === "GET") return json({ username, quota: PER_USER_BYTES });
+    if (path === "/api/list" && request.method === "GET") return await apiList(request, env, username);
+    if (path === "/api/upload" && request.method === "POST") return await apiUpload(request, env, username);
+    if (path === "/api/presign" && request.method === "POST") return await apiPresign(request, env, username);
+    if (path === "/api/finalize" && request.method === "POST") return await apiFinalize(request, env, username);
+    if (path === "/api/remote" && request.method === "POST") return await apiRemote(request, env, username);
+    if (path === "/api/delete" && request.method === "POST") return await apiDelete(request, env, username);
+    if (path === "/api/rename" && request.method === "POST") return await apiRename(request, env, username);
+    if (path === "/api/share" && request.method === "POST") return await apiShare(request, env, username);
+    if (path === "/api/changepass" && request.method === "POST") return await apiChangePass(request, env, context.user);
+    if (path === "/api/download" && request.method === "GET") return await apiDownload(request, env, username);
+    if (path === "/api/view" && request.method === "GET") return await apiView(request, env, username);
+    if (path === "/api/folder/create" && request.method === "POST") return await apiFolderCreate(request, env, username);
+    if (path === "/api/folder/delete" && request.method === "POST") return await apiFolderDelete(request, env, username);
+    if (path === "/api/folder/rename" && request.method === "POST") return await apiFolderRename(request, env, username);
+    if (path === "/api/move" && request.method === "POST") return await apiMove(request, env, username);
 
     // ---------- Main page ----------
     if (path === "/" || path === "/index.html") return html(APP_HTML);
 
     return new Response("Not Found", { status: 404 });
   } catch (err) {
-    // internal error message ကို client ဆီ မပို့ (info leak ကာကွယ်)
     return json({ error: "server error" }, 500);
   }
 }
 
-// ======================= Handlers =======================
+// ======================= Auth Handlers =======================
+
+async function handleRegister(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const body = await request.json().catch(() => ({}));
+  let { username, password } = body;
+  username = String(username || "").trim();
+  password = String(password || "");
+
+  if (!USERNAME_RE.test(username)) {
+    return json({ error: "Username က စာလုံး ၃-၂၀ လုံး (a-z, 0-9, _) သာ ဖြစ်ရပါမည်။" }, 400);
+  }
+  if (password.length < 6) {
+    return json({ error: "Password အနည်းဆုံး ၆ လုံး ထားပါ။" }, 400);
+  }
+
+  const existing = await loadUser(env, username);
+  if (existing) {
+    return json({ error: "ဤ Username ကို သုံးပြီးသားဖြစ်ပါသည်။" }, 409);
+  }
+
+  const { salt, hash } = await hashPassword(password);
+  const account = {
+    username: username.toLowerCase(),
+    displayName: username,
+    salt, hash,
+    createdAt: nowMM(),
+  };
+  await saveUser(env, account);
+
+  // empty meta ဖန်တီး
+  await saveMeta(env, account.username, { totalBytes: 0, files: {}, folders: {} });
+
+  const tok = await makeToken(env, account.username);
+  return json({ ok: true }, 200, {
+    "Set-Cookie": `session=${tok}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(SESSION_MS / 1000)}`,
+  });
+}
 
 async function handleLogin(request, env) {
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
@@ -381,41 +461,47 @@ async function handleLogin(request, env) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const { username, password } = body;
+  let { username, password } = body;
+  username = String(username || "").trim().toLowerCase();
+  password = String(password || "");
 
-  const meta = await loadMeta(env);
-  const currentPass = meta.password || env.AUTH_PASS;
+  const account = await loadUser(env, username);
+  let ok = false;
+  if (account) {
+    ok = await verifyPassword(password, account.salt, account.hash);
+  } else {
+    // user မရှိရင်လည်း timing flatten အတွက် dummy hash တွက်
+    await hashPassword(password, "00000000000000000000000000000000");
+  }
 
-  // constant-time compare နှစ်ခုလုံး
-  const okUser = safeEqual(username, env.AUTH_USER);
-  const okPass = safeEqual(password, currentPass);
-
-  if (okUser && okPass) {
+  if (ok) {
     delete lock[ip];
     await saveLock(env, lock);
-    const tok = await makeToken(env, username);
+    const tok = await makeToken(env, account.username);
     return json({ ok: true }, 200, {
       "Set-Cookie": `session=${tok}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(SESSION_MS / 1000)}`,
     });
   }
 
   rec.fails = (rec.fails || 0) + 1;
-  if (rec.fails >= 3) {
+  if (rec.fails >= 5) {
     rec.until = Date.now() + 5 * 60 * 1000;
     rec.fails = 0;
   }
   lock[ip] = rec;
   await saveLock(env, lock);
-  const left = rec.until ? 0 : 3 - rec.fails;
+  const left = rec.until ? 0 : 5 - rec.fails;
   return json({
     error: rec.until
-      ? "အကြိမ် ၃ ကြိမ် မှားသွားပါပြီ။ ၅ မိနစ် စောင့်ပါ။"
+      ? "အကြိမ် ၅ ကြိမ် မှားသွားပါပြီ။ ၅ မိနစ် စောင့်ပါ။"
       : `Username သို့မဟုတ် Password မှားနေပါသည်။ (ကျန် ${left} ကြိမ်)`,
   }, 401);
 }
 
-async function apiList(request, env) {
-  const meta = await loadMeta(env);
+// ======================= File Handlers (per-user) =======================
+
+async function apiList(request, env, username) {
+  const meta = await loadMeta(env, username);
   const url = new URL(request.url);
   const folder = url.searchParams.get("folder") || "";
 
@@ -448,32 +534,30 @@ async function apiList(request, env) {
 
   return json({
     files, folders, breadcrumb, currentFolder: folder,
-    totalBytes: meta.totalBytes || 0, maxBytes: MAX_TOTAL_BYTES,
+    totalBytes: meta.totalBytes || 0, maxBytes: PER_USER_BYTES,
   });
 }
 
-// --- Small file direct upload (multipart/form-data) ---
-async function apiUpload(request, env) {
-  const meta = await loadMeta(env);
+async function apiUpload(request, env, username) {
+  const meta = await loadMeta(env, username);
   const form = await request.formData();
   const file = form.get("file");
   const folder = (form.get("folder") || "").toString();
-  const customName = (form.get("name") || "").toString(); // ✅ custom filename
+  const customName = (form.get("name") || "").toString();
   if (!file || typeof file === "string") return json({ error: "ဖိုင်မပါပါ" }, 400);
   if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
   const size = file.size;
-  if ((meta.totalBytes || 0) + size > MAX_TOTAL_BYTES) {
-    return json({ error: "Storage 10GB ပြည့်သွားပါပြီ။ တင်၍မရပါ။" }, 413);
+  if ((meta.totalBytes || 0) + size > PER_USER_BYTES) {
+    return json({ error: "သိုလှောင်ခန့် ပြည့်သွားပါပြီ။ တင်၍မရပါ။" }, 413);
   }
 
   const id = randId();
-  const key = `files/${id}`;
+  const key = `users/${username}/files/${id}`;
   await env.R2.put(key, file.stream(), {
     httpMetadata: { contentType: file.type || "application/octet-stream" },
   });
 
-  // custom name ပါရင် အဲ့ဒါသုံး၊ extension မပါရင် မူရင်းကနေ ဖြည့်
   let fname = cleanName(customName || file.name, id);
   if (customName && !/\.[a-z0-9]{1,8}$/i.test(fname)) {
     const origExt = (file.name.match(/\.[a-z0-9]{1,8}$/i) || [""])[0];
@@ -487,46 +571,44 @@ async function apiUpload(request, env) {
     uploadedAt: nowMM(), folder, key,
   };
   meta.totalBytes = (meta.totalBytes || 0) + size;
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true, id });
 }
 
-// --- Large file: get presigned PUT url ---
-async function apiPresign(request, env) {
-  const meta = await loadMeta(env);
+async function apiPresign(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { name, size, type, folder } = body;
   if (!name || !size) return json({ error: "name/size မပါပါ" }, 400);
   if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
-  if ((meta.totalBytes || 0) + Number(size) > MAX_TOTAL_BYTES) {
-    return json({ error: "Storage 10GB ပြည့်သွားပါပြီ။ တင်၍မရပါ။" }, 413);
+  if ((meta.totalBytes || 0) + Number(size) > PER_USER_BYTES) {
+    return json({ error: "သိုလှောင်ခန့် ပြည့်သွားပါပြီ။ တင်၍မရပါ။" }, 413);
   }
 
   const id = randId();
-  const key = `files/${id}`;
-  const uploadUrl = await presignR2Put(env, key, 3600);
+  const key = `users/${username}/files/${id}`;
+  const uploadUrl = await presignPut(env, key, 3600);
   return json({ ok: true, id, key, uploadUrl });
 }
 
-// --- finalize metadata after presigned PUT ---
-async function apiFinalize(request, env) {
-  const meta = await loadMeta(env);
+async function apiFinalize(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id, key, name, type, folder } = body;
   if (!id || !key) return json({ error: "id/key မပါပါ" }, 400);
   if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
-  // key spoof guard: server က သတ်မှတ်တဲ့ pattern မှ ခွင့်ပြု
-  if (key !== `files/${id}` || !/^[a-f0-9]{32}$/.test(id)) {
+  // key spoof guard: ဒီ user ရဲ့ prefix နဲ့ pattern မှ ခွင့်ပြု
+  if (key !== `users/${username}/files/${id}` || !/^[a-f0-9]{32}$/.test(id)) {
     return json({ error: "invalid key" }, 400);
   }
 
   const head = await env.R2.head(key);
-  if (!head) return json({ error: "R2 ထဲတွင် ဖိုင်မတွေ့ပါ" }, 400);
+  if (!head) return json({ error: "ဖိုင်မတွေ့ပါ" }, 400);
   const realSize = head.size;
 
-  if ((meta.totalBytes || 0) + realSize > MAX_TOTAL_BYTES) {
+  if ((meta.totalBytes || 0) + realSize > PER_USER_BYTES) {
     await env.R2.delete(key);
-    return json({ error: "Storage 10GB ကျော်သွားသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
+    return json({ error: "သိုလှောင်ခန့် ကျော်သွားသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
   }
 
   meta.files = meta.files || {};
@@ -536,19 +618,17 @@ async function apiFinalize(request, env) {
     uploadedAt: nowMM(), folder: folder || "", key,
   };
   meta.totalBytes = (meta.totalBytes || 0) + realSize;
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true, id });
 }
 
-// --- Remote URL upload ---
-async function apiRemote(request, env) {
-  const meta = await loadMeta(env);
+async function apiRemote(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { url: remoteUrl, name, folder } = body;
   if (!remoteUrl) return json({ error: "URL မပါပါ" }, 400);
   if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
 
-  // SSRF guard
   let parsed;
   try { parsed = new URL(remoteUrl); } catch { return json({ error: "URL မှားနေပါသည်" }, 400); }
   if (!/^https?:$/.test(parsed.protocol)) return json({ error: "http/https သာ ခွင့်ပြုသည်" }, 400);
@@ -566,12 +646,12 @@ async function apiRemote(request, env) {
   if (declared && declared > MAX_REMOTE_BYTES) {
     return json({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးနေပါသည်။" }, 413);
   }
-  if (declared && (meta.totalBytes || 0) + declared > MAX_TOTAL_BYTES) {
-    return json({ error: "Storage 10GB ပြည့်သွားပါပြီ။" }, 413);
+  if (declared && (meta.totalBytes || 0) + declared > PER_USER_BYTES) {
+    return json({ error: "သိုလှောင်ခန့် ပြည့်သွားပါပြီ။" }, 413);
   }
 
   const id = randId();
-  const key = `files/${id}`;
+  const key = `users/${username}/files/${id}`;
   const ctype = resp.headers.get("Content-Type") || "application/octet-stream";
   await env.R2.put(key, resp.body, { httpMetadata: { contentType: ctype } });
 
@@ -581,9 +661,9 @@ async function apiRemote(request, env) {
     await env.R2.delete(key);
     return json({ error: "Remote ဖိုင်သည် 1.5GB ထက်ကြီးသဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
   }
-  if ((meta.totalBytes || 0) + realSize > MAX_TOTAL_BYTES) {
+  if ((meta.totalBytes || 0) + realSize > PER_USER_BYTES) {
     await env.R2.delete(key);
-    return json({ error: "Storage 10GB ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
+    return json({ error: "သိုလှောင်ခန့် ကျော်သဖြင့် ဖျက်လိုက်ပါပြီ။" }, 413);
   }
 
   let fname = name;
@@ -608,7 +688,7 @@ async function apiRemote(request, env) {
   meta.files = meta.files || {};
   meta.files[id] = { name: fname, size: realSize, type: ctype, uploadedAt: nowMM(), folder: folder || "", key };
   meta.totalBytes = (meta.totalBytes || 0) + realSize;
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true, id });
 }
 
@@ -626,8 +706,8 @@ function extFromType(ctype) {
   return map[(ctype || "").split(";")[0].trim().toLowerCase()] || "";
 }
 
-async function apiDelete(request, env) {
-  const meta = await loadMeta(env);
+async function apiDelete(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id } = body;
   const f = meta.files?.[id];
@@ -635,31 +715,29 @@ async function apiDelete(request, env) {
   await env.R2.delete(f.key);
   meta.totalBytes = Math.max(0, (meta.totalBytes || 0) - (f.size || 0));
   delete meta.files[id];
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true });
 }
 
-// ✅ NEW: Rename a file (keeps extension if new name has none)
-async function apiRename(request, env) {
-  const meta = await loadMeta(env);
+async function apiRename(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   let { id, name } = body;
   const f = meta.files?.[id];
   if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
   name = cleanName(name, "");
   if (!name) return json({ error: "နာမည် ထည့်ပါ" }, 400);
-  // extension မပါရင် မူရင်းဖိုင်ရဲ့ extension ကို ဆက်ထား
   if (!/\.[a-z0-9]{1,8}$/i.test(name)) {
     const oldExt = (f.name.match(/\.[a-z0-9]{1,8}$/i) || [""])[0];
     if (oldExt) name += oldExt;
   }
   f.name = name;
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true, name });
 }
 
-async function apiShare(request, env) {
-  const meta = await loadMeta(env);
+async function apiShare(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id, duration } = body;
   const f = meta.files?.[id];
@@ -667,7 +745,7 @@ async function apiShare(request, env) {
 
   if (duration === "off") {
     delete f.share;
-    await saveMeta(env, meta);
+    await saveMeta(env, username, meta);
     return json({ ok: true, share: null });
   }
   const map = { "2d": 2 * 86400e3, "1w": 7 * 86400e3, "1m": 30 * 86400e3, "1y": 365 * 86400e3 };
@@ -678,57 +756,75 @@ async function apiShare(request, env) {
     expiresAt = Date.now() + ms;
   }
   const token = f.share?.token || randId();
+  // share token ထဲ owner ကို မှတ်ထား (handleShare မှာ ရှာရလွယ်စေရန်)
   f.share = { token, expiresAt };
-  await saveMeta(env, meta);
+  await saveShareIndex(env, token, username, id);
+  await saveMeta(env, username, meta);
   return json({ ok: true, share: { token, expiresAt, name: f.name } });
 }
 
-async function apiChangePass(request, env) {
+// share token → {username, fileId} mapping
+function shareKey(token) { return `__shares__/${token}.json`; }
+async function saveShareIndex(env, token, username, fileId) {
+  await env.R2.put(shareKey(token), JSON.stringify({ username, fileId }), {
+    httpMetadata: { contentType: "application/json" },
+  });
+}
+async function loadShareIndex(env, token) {
+  if (!/^[a-f0-9]{32}$/.test(token)) return null;
+  const obj = await env.R2.get(shareKey(token));
+  if (!obj) return null;
+  try { return JSON.parse(await obj.text()); } catch { return null; }
+}
+
+async function apiChangePass(request, env, account) {
   const body = await request.json().catch(() => ({}));
   const { oldPass, newPass } = body;
-  const meta = await loadMeta(env);
-  const currentPass = meta.password || env.AUTH_PASS;
-  if (!safeEqual(oldPass, currentPass)) return json({ error: "လက်ရှိ password မှားနေပါသည်" }, 400);
-  if (!newPass || newPass.length < 6) return json({ error: "password အနည်းဆုံး ၆ လုံးထားပါ" }, 400);
-  meta.password = newPass;
-  await saveMeta(env, meta);
+  const ok = await verifyPassword(String(oldPass || ""), account.salt, account.hash);
+  if (!ok) return json({ error: "လက်ရှိ password မှားနေပါသည်" }, 400);
+  if (!newPass || String(newPass).length < 6) return json({ error: "password အနည်းဆုံး ၆ လုံးထားပါ" }, 400);
+  const { salt, hash } = await hashPassword(String(newPass));
+  account.salt = salt;
+  account.hash = hash;
+  await saveUser(env, account);
   return json({ ok: true });
 }
 
-async function apiDownload(request, env) {
+async function apiDownload(request, env, username) {
   const url = new URL(request.url);
   const id = url.searchParams.get("id");
-  const meta = await loadMeta(env);
+  const meta = await loadMeta(env, username);
   const f = meta.files?.[id];
   if (!f) return new Response("Not Found", { status: 404 });
   return await serveObject(request, env, f, { inlineDefault: false });
 }
 
-async function apiView(request, env) {
+async function apiView(request, env, username) {
   const url = new URL(request.url);
   const id = url.searchParams.get("id");
-  const meta = await loadMeta(env);
+  const meta = await loadMeta(env, username);
   const f = meta.files?.[id];
   if (!f) return new Response("Not Found", { status: 404 });
   return await serveObject(request, env, f, { inlineDefault: true });
 }
 
 async function handleShare(request, env, token) {
-  const meta = await loadMeta(env);
-  let target = null;
-  for (const [, f] of Object.entries(meta.files || {})) {
-    if (f.share && f.share.token === token) { target = f; break; }
+  const idx = await loadShareIndex(env, token);
+  if (!idx) return new Response("Link မတွေ့ပါ", { status: 404 });
+  const meta = await loadMeta(env, idx.username);
+  const target = meta.files?.[idx.fileId];
+  if (!target || !target.share || target.share.token !== token) {
+    return new Response("Link မတွေ့ပါ", { status: 404 });
   }
-  if (!target) return new Response("Link မတွေ့ပါ", { status: 404 });
   if (target.share.expiresAt && Date.now() > target.share.expiresAt) {
     return new Response("ဤ link သက်တမ်းကုန်သွားပါပြီ။ (မူရင်းဖိုင်မပျက်ပါ)", { status: 410 });
   }
   return await serveObject(request, env, target, { inlineDefault: true });
 }
 
-// ======================= Folder Handlers =======================
-async function apiFolderCreate(request, env) {
-  const meta = await loadMeta(env);
+// ======================= Folder Handlers (per-user) =======================
+async function apiFolderCreate(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   let { name, parent } = body;
   name = (name || "").toString().trim();
@@ -742,12 +838,12 @@ async function apiFolderCreate(request, env) {
   if (dup) return json({ error: "ဤနာမည်ဖြင့် folder ရှိပြီးသားပါ" }, 400);
   const id = randId();
   meta.folders[id] = { name, parent, createdAt: nowMM() };
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true, id });
 }
 
-async function apiFolderRename(request, env) {
-  const meta = await loadMeta(env);
+async function apiFolderRename(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   let { id, name } = body;
   name = (name || "").toString().trim();
@@ -755,12 +851,12 @@ async function apiFolderRename(request, env) {
   if (!fd) return json({ error: "Folder မတွေ့ပါ" }, 404);
   if (!name) return json({ error: "နာမည် ထည့်ပါ" }, 400);
   fd.name = name;
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true });
 }
 
-async function apiFolderDelete(request, env) {
-  const meta = await loadMeta(env);
+async function apiFolderDelete(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id } = body;
   if (!meta.folders?.[id]) return json({ error: "Folder မတွေ့ပါ" }, 404);
@@ -780,74 +876,74 @@ async function apiFolderDelete(request, env) {
     }
   }
   for (const fid of toDelete) delete meta.folders[fid];
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true });
 }
 
-async function apiMove(request, env) {
-  const meta = await loadMeta(env);
+async function apiMove(request, env, username) {
+  const meta = await loadMeta(env, username);
   const body = await request.json().catch(() => ({}));
   const { id, folder } = body;
   const f = meta.files?.[id];
   if (!f) return json({ error: "ဖိုင်မတွေ့ပါ" }, 404);
   if (folder && !meta.folders[folder]) return json({ error: "Folder မတွေ့ပါ" }, 400);
   f.folder = folder || "";
-  await saveMeta(env, meta);
+  await saveMeta(env, username, meta);
   return json({ ok: true });
 }
+
+// ======================= HTML Pages =======================
+
+const AUTH_CSS = `
+:root{--brand:#4f46e5;--brand2:#7c3aed;--accent:#06b6d4;--bg1:#f8fafc;--ink:#0f172a;--muted:#64748b}
+*{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',-apple-system,sans-serif}
+html,body{height:100%}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:linear-gradient(135deg,#eef2ff 0%,#faf5ff 50%,#ecfeff 100%);padding:20px;position:relative;overflow-x:hidden}
+.blob{position:fixed;border-radius:50%;filter:blur(80px);opacity:.4;z-index:0;pointer-events:none}
+.blob.a{width:380px;height:380px;background:#a5b4fc;top:-120px;left:-80px}
+.blob.b{width:340px;height:340px;background:#67e8f9;bottom:-100px;right:-70px}
+.card{position:relative;z-index:1;background:#fff;border:1px solid #eef0f5;
+padding:40px 32px;border-radius:24px;box-shadow:0 20px 60px rgba(15,23,42,.12);width:100%;max-width:410px;color:var(--ink)}
+.logo{width:60px;height:60px;margin:0 auto 18px;border-radius:18px;display:flex;align-items:center;justify-content:center;
+background:linear-gradient(135deg,var(--brand),var(--accent));box-shadow:0 10px 26px rgba(79,70,229,.4);font-size:30px}
+h1{margin:0 0 4px;font-size:23px;text-align:center;font-weight:800;color:var(--ink)}
+.sub{text-align:center;color:var(--muted);font-size:13px;margin-bottom:26px}
+.field{position:relative;margin:13px 0}
+.field label{display:block;font-size:12px;font-weight:700;color:#475569;margin-bottom:5px}
+.field input{width:100%;padding:13px 14px;border:1px solid #e2e8f0;border-radius:13px;font-size:15px;
+background:#f8fafc;color:var(--ink);outline:none;transition:.2s}
+.field input:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(79,70,229,.14);background:#fff}
+.hint{font-size:11px;color:var(--muted);margin-top:4px}
+button.main{width:100%;padding:14px;margin-top:16px;border:0;border-radius:13px;font-size:16px;font-weight:700;cursor:pointer;color:#fff;
+background:linear-gradient(135deg,var(--brand),var(--brand2));box-shadow:0 10px 24px rgba(79,70,229,.35);transition:.2s;
+display:flex;align-items:center;justify-content:center;gap:8px}
+button.main:hover{transform:translateY(-2px);box-shadow:0 14px 30px rgba(79,70,229,.5)}
+button.main:disabled{opacity:.7;cursor:not-allowed;transform:none}
+.spin{width:18px;height:18px;border:2.5px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;
+animation:spin .7s linear infinite;display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.err{color:#dc2626;font-size:13px;margin-top:12px;text-align:center;min-height:18px}
+.swap{text-align:center;margin-top:20px;font-size:13.5px;color:var(--muted)}
+.swap a{color:var(--brand);font-weight:700;text-decoration:none}
+.swap a:hover{text-decoration:underline}
+`;
+
 const LOGIN_HTML = `<!DOCTYPE html>
 <html lang="my"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fast Lugyi Storage • ဝင်ရန်</title>
-<style>
-:root{--brand1:#6d28d9;--brand2:#2563eb;--accent:#06b6d4}
-*{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
-html,body{height:100%}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-background:radial-gradient(1200px 600px at 10% 0%,#1e1b4b,transparent),
-radial-gradient(1000px 500px at 90% 100%,#0c4a6e,transparent),
-linear-gradient(135deg,#0b1020,#111827 45%,#1e1b4b);
-background-attachment:fixed;padding:16px;position:relative;overflow-x:hidden}
-.orb{position:fixed;border-radius:50%;filter:blur(90px);opacity:.5;z-index:0;pointer-events:none;
-animation:float 9s ease-in-out infinite;will-change:transform}
-.orb.a{width:360px;height:360px;background:#7c3aed;top:-90px;left:-70px}
-.orb.b{width:320px;height:320px;background:#06b6d4;bottom:-80px;right:-60px;animation-delay:-4s}
-@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-26px)}}
-.card{position:relative;z-index:1;background:rgba(255,255,255,.07);backdrop-filter:blur(22px);
-border:1px solid rgba(255,255,255,.16);padding:38px 30px;border-radius:24px;
-box-shadow:0 30px 70px rgba(0,0,0,.5);width:100%;max-width:400px;color:#fff}
-.logo{width:66px;height:66px;margin:0 auto 16px;border-radius:20px;display:flex;align-items:center;justify-content:center;
-background:linear-gradient(135deg,var(--brand1),var(--accent));box-shadow:0 10px 30px rgba(124,58,237,.55);font-size:32px}
-h1{margin:0 0 4px;font-size:24px;text-align:center;font-weight:800;letter-spacing:.3px;
-background:linear-gradient(90deg,#c4b5fd,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
-.sub{text-align:center;color:rgba(255,255,255,.62);font-size:13px;margin-bottom:24px}
-.field{position:relative;margin:13px 0}
-.field input{width:100%;padding:14px 14px 14px 44px;border:1px solid rgba(255,255,255,.18);
-border-radius:14px;font-size:15px;background:rgba(255,255,255,.06);color:#fff;outline:none;transition:.25s}
-.field input::placeholder{color:rgba(255,255,255,.5)}
-.field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(6,182,212,.25);background:rgba(255,255,255,.1)}
-.field .ic{position:absolute;left:15px;top:50%;transform:translateY(-50%);opacity:.7}
-button{width:100%;padding:14px;margin-top:12px;border:0;border-radius:14px;font-size:16px;font-weight:700;cursor:pointer;color:#fff;
-background:linear-gradient(135deg,var(--brand1),var(--brand2));box-shadow:0 10px 26px rgba(37,99,235,.45);transition:.25s;
-display:flex;align-items:center;justify-content:center;gap:8px}
-button:hover{transform:translateY(-2px);box-shadow:0 16px 34px rgba(37,99,235,.6)}
-button:disabled{opacity:.7;cursor:not-allowed;transform:none}
-.spin{width:18px;height:18px;border:2.5px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;
-animation:spin .7s linear infinite;display:none}
-@keyframes spin{to{transform:rotate(360deg)}}
-.err{color:#fca5a5;font-size:13px;margin-top:12px;text-align:center;min-height:18px}
-.foot{text-align:center;margin-top:18px;font-size:11px;color:rgba(255,255,255,.45)}
-</style></head><body>
-<div class="orb a"></div><div class="orb b"></div>
+<title>Lugyi Cloud • ဝင်ရန်</title>
+<style>${AUTH_CSS}</style></head><body>
+<div class="blob a"></div><div class="blob b"></div>
 <div class="card">
-<div class="logo">⚡</div>
-<h1>Fast Lugyi Storage</h1>
-<div class="sub">🔒 လုံခြုံစိတ်ချရသော Cloud သိုလှောင်မှု</div>
-<div class="field"><span class="ic">👤</span><input id="u" placeholder="Username" autocomplete="username"></div>
-<div class="field"><span class="ic">🔑</span><input id="p" type="password" placeholder="Password" autocomplete="current-password"></div>
-<button id="btn" onclick="login()"><span class="spin" id="spin"></span><span id="btnTxt">🚀 ဝင်မည်</span></button>
+<div class="logo">☁️</div>
+<h1>Lugyi Cloud</h1>
+<div class="sub">အကောင့်ဝင်၍ သင့်ဖိုင်များ စီမံပါ</div>
+<div class="field"><label>အသုံးပြုသူအမည်</label><input id="u" placeholder="username" autocomplete="username"></div>
+<div class="field"><label>စကားဝှက်</label><input id="p" type="password" placeholder="••••••" autocomplete="current-password"></div>
+<button class="main" id="btn" onclick="login()"><span class="spin" id="spin"></span><span id="btnTxt">ဝင်မည်</span></button>
 <div class="err" id="err"></div>
-<div class="foot">Powered by Cloudflare R2 • Premium Edition</div>
+<div class="swap">အကောင့်မရှိသေးဘူးလား? <a href="/register">အကောင့်ဖွင့်ရန်</a></div>
 </div>
 <script>
 async function login(){
@@ -861,113 +957,142 @@ async function login(){
     if(r.ok){location.href='/';return;}
     document.getElementById('err').textContent=d.error||'ဝင်၍မရပါ';
   }catch(e){document.getElementById('err').textContent='ကွန်ရက် ပြဿနာ';}
-  btn.disabled=false;spin.style.display='none';btnTxt.textContent='🚀 ဝင်မည်';
+  btn.disabled=false;spin.style.display='none';btnTxt.textContent='ဝင်မည်';
 }
 document.getElementById('p').addEventListener('keydown',e=>{if(e.key==='Enter')login();});
 document.getElementById('u').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('p').focus();});
 </script>
 </body></html>`;
+
+const REGISTER_HTML = `<!DOCTYPE html>
+<html lang="my"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lugyi Cloud • အကောင့်ဖွင့်ရန်</title>
+<style>${AUTH_CSS}</style></head><body>
+<div class="blob a"></div><div class="blob b"></div>
+<div class="card">
+<div class="logo">✨</div>
+<h1>အကောင့်အသစ်ဖွင့်ရန်</h1>
+<div class="sub">အခမဲ့ Cloud သိုလှောင်ခန့် ရယူပါ</div>
+<div class="field"><label>အသုံးပြုသူအမည်</label><input id="u" placeholder="username" autocomplete="username">
+<div class="hint">စာလုံး ၃-၂၀ လုံး (a-z, A-Z, 0-9, _)</div></div>
+<div class="field"><label>စကားဝှက်</label><input id="p" type="password" placeholder="••••••" autocomplete="new-password">
+<div class="hint">အနည်းဆုံး ၆ လုံး</div></div>
+<div class="field"><label>စကားဝှက် အတည်ပြုရန်</label><input id="p2" type="password" placeholder="••••••" autocomplete="new-password"></div>
+<button class="main" id="btn" onclick="reg()"><span class="spin" id="spin"></span><span id="btnTxt">အကောင့်ဖွင့်မည်</span></button>
+<div class="err" id="err"></div>
+<div class="swap">အကောင့်ရှိပြီးသားလား? <a href="/login">ဝင်ရန်</a></div>
+</div>
+<script>
+async function reg(){
+  const err=document.getElementById('err');err.textContent='';
+  if(p.value!==p2.value){err.textContent='စကားဝှက် နှစ်ခု မတူပါ';return;}
+  const btn=document.getElementById('btn'),spin=document.getElementById('spin'),btnTxt=document.getElementById('btnTxt');
+  btn.disabled=true;spin.style.display='block';btnTxt.textContent='ဖွင့်နေသည်...';
+  try{
+    const r=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:u.value,password:p.value})});
+    const d=await r.json();
+    if(r.ok){location.href='/';return;}
+    err.textContent=d.error||'အကောင့်မဖွင့်နိုင်ပါ';
+  }catch(e){err.textContent='ကွန်ရက် ပြဿနာ';}
+  btn.disabled=false;spin.style.display='none';btnTxt.textContent='အကောင့်ဖွင့်မည်';
+}
+['u','p','p2'].forEach((id,i,a)=>document.getElementById(id).addEventListener('keydown',e=>{
+  if(e.key==='Enter'){if(i<a.length-1)document.getElementById(a[i+1]).focus();else reg();}}));
+</script>
+</body></html>`;
+
 const APP_HTML = `<!DOCTYPE html>
 <html lang="my"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fast Lugyi Storage</title>
+<title>Lugyi Cloud</title>
 <style>
-:root{--b1:#6d28d9;--b2:#2563eb;--acc:#06b6d4;--ink:#0f172a;--muted:#64748b;--line:#e6e9f2;
---card:rgba(255,255,255,.85);--ok:#16a34a;--danger:#ef4444}
-*{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',sans-serif}
-body{margin:0;color:var(--ink);min-height:100vh;
-background:
-radial-gradient(900px 500px at 100% -8%,#ede9fe,transparent),
-radial-gradient(800px 500px at -10% 5%,#cffafe,transparent),
-radial-gradient(600px 400px at 50% 110%,#fce7f3,transparent),
-linear-gradient(180deg,#f6f8ff,#eef2fb)}
+:root{--brand:#4f46e5;--brand2:#7c3aed;--acc:#06b6d4;--ink:#0f172a;--muted:#64748b;--line:#e8ecf3;
+--card:#fff;--bg:#f1f5f9;--ok:#16a34a;--danger:#ef4444}
+*{box-sizing:border-box;font-family:system-ui,'Padauk','Myanmar3',-apple-system,sans-serif}
+body{margin:0;color:var(--ink);min-height:100vh;background:var(--bg)}
 /* ===== Top bar ===== */
-header{position:sticky;top:0;z-index:30;backdrop-filter:blur(16px);
-background:linear-gradient(135deg,rgba(109,40,217,.96),rgba(37,99,235,.96));color:#fff;
-padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
-box-shadow:0 10px 34px rgba(37,99,235,.32)}
-.brand{display:flex;align-items:center;gap:12px}
-.brand .lg{width:44px;height:44px;border-radius:14px;background:rgba(255,255,255,.18);
-display:flex;align-items:center;justify-content:center;font-size:24px;
-box-shadow:inset 0 0 0 1px rgba(255,255,255,.3),0 6px 18px rgba(0,0,0,.18)}
-.brand h1{margin:0;font-size:19px;font-weight:800;letter-spacing:.3px}
-.brand .tagline{font-size:11px;opacity:.85;font-weight:500;margin-top:1px}
-.topbtns{display:flex;gap:8px;flex-wrap:wrap}
-button{padding:10px 15px;border:0;border-radius:12px;color:#fff;cursor:pointer;font-size:14px;font-weight:600;transition:.18s;
-background:linear-gradient(135deg,var(--b1),var(--b2));box-shadow:0 5px 14px rgba(37,99,235,.3)}
-button:hover{transform:translateY(-1px);box-shadow:0 9px 22px rgba(37,99,235,.4)}
+header{position:sticky;top:0;z-index:30;background:#fff;border-bottom:1px solid var(--line);
+padding:12px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:11px}
+.brand .lg{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,var(--brand),var(--acc));
+display:flex;align-items:center;justify-content:center;font-size:21px;color:#fff;box-shadow:0 6px 16px rgba(79,70,229,.3)}
+.brand h1{margin:0;font-size:18px;font-weight:800;color:var(--ink)}
+.brand .tagline{font-size:11px;color:var(--muted);margin-top:1px}
+.topbtns{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.userchip{display:flex;align-items:center;gap:8px;background:#f1f5f9;border:1px solid var(--line);
+padding:6px 12px;border-radius:30px;font-size:13px;font-weight:700;color:#334155}
+.userchip .av{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,var(--brand),var(--brand2));
+color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800}
+button{padding:9px 14px;border:0;border-radius:11px;color:#fff;cursor:pointer;font-size:14px;font-weight:600;transition:.18s;
+background:linear-gradient(135deg,var(--brand),var(--brand2));box-shadow:0 4px 12px rgba(79,70,229,.28)}
+button:hover{transform:translateY(-1px);box-shadow:0 8px 18px rgba(79,70,229,.36)}
 button:active{transform:translateY(0)}
 button:disabled{opacity:.55;cursor:not-allowed;transform:none}
-button.sec{background:#eef2f8;color:#334155;box-shadow:none}
+button.sec{background:#f1f5f9;color:#334155;box-shadow:none}
 button.sec:hover{background:#e2e8f0}
-button.danger{background:linear-gradient(135deg,#f43f5e,#dc2626);box-shadow:0 5px 14px rgba(239,68,68,.28)}
-button.ghost{background:rgba(255,255,255,.14);color:#fff;border:1px solid rgba(255,255,255,.4);box-shadow:none}
-button.ghost:hover{background:rgba(255,255,255,.26)}
-input,select{padding:11px 12px;border:1px solid #d6dbe7;border-radius:12px;font-size:14px;background:#fff;outline:none;transition:.2s;color:var(--ink)}
-input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(6,182,212,.18)}
-.wrap{max-width:1040px;margin:0 auto;padding:18px 16px 60px}
-/* ===== Stat / usage card ===== */
-.hero{display:grid;grid-template-columns:1.3fr 1fr;gap:14px;margin-bottom:16px}
-@media(max-width:720px){.hero{grid-template-columns:1fr}}
-.glass{background:var(--card);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.7);
-border-radius:20px;padding:18px;box-shadow:0 10px 34px rgba(15,23,42,.07)}
+button.danger{background:linear-gradient(135deg,#f43f5e,#dc2626);box-shadow:0 4px 12px rgba(239,68,68,.26)}
+button.ghost{background:#f1f5f9;color:#475569;box-shadow:none}
+button.ghost:hover{background:#e2e8f0}
+input,select{padding:11px 12px;border:1px solid #dbe1ea;border-radius:11px;font-size:14px;background:#fff;outline:none;transition:.2s;color:var(--ink)}
+input:focus,select:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(79,70,229,.13)}
+.wrap{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
+/* ===== usage card ===== */
+.hero{display:grid;grid-template-columns:1.3fr 1fr;gap:14px;margin-bottom:18px}
+@media(max-width:760px){.hero{grid-template-columns:1fr}}
+.glass{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;
+box-shadow:0 2px 10px rgba(15,23,42,.04)}
 .usage-top{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.usage-top .ic{width:46px;height:46px;border-radius:14px;background:linear-gradient(135deg,#ede9fe,#dbeafe);
+.usage-top .ic{width:46px;height:46px;border-radius:14px;background:linear-gradient(135deg,#eef2ff,#e0f2fe);
 display:flex;align-items:center;justify-content:center;font-size:24px}
 .usage-num{font-size:22px;font-weight:800;line-height:1.1}
 .usage-sub{font-size:12px;color:var(--muted)}
-.prog{height:14px;background:#e9edf6;border-radius:10px;overflow:hidden;margin-top:14px;box-shadow:inset 0 1px 3px rgba(0,0,0,.08)}
-.prog>i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#06b6d4,#2563eb);
-background-size:200% 100%;transition:width .6s;border-radius:10px;animation:flow 3s linear infinite}
-@keyframes flow{to{background-position:200% 0}}
+.prog{height:12px;background:#eef2f7;border-radius:8px;overflow:hidden;margin-top:14px}
+.prog>i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#06b6d4,#4f46e5);
+transition:width .6s;border-radius:8px}
 .prog.warn>i{background:linear-gradient(90deg,#f59e0b,#ef4444)}
-.mini{display:flex;gap:14px;margin-top:8px;flex-wrap:wrap}
-.mini .m{flex:1;min-width:90px;text-align:center;background:rgba(255,255,255,.6);border-radius:14px;padding:10px;border:1px solid var(--line)}
-.mini .m b{font-size:18px;display:block}
+.mini{display:flex;gap:12px;margin-top:14px;flex-wrap:wrap}
+.mini .m{flex:1;min-width:90px;text-align:center;background:#f8fafc;border-radius:13px;padding:11px;border:1px solid var(--line)}
+.mini .m b{font-size:18px;display:block;color:var(--ink)}
 .mini .m span{font-size:11px;color:var(--muted)}
 /* ===== Upload zone ===== */
-.dropzone{border:2px dashed #c3cde0;border-radius:18px;padding:22px;text-align:center;cursor:pointer;
-transition:.2s;background:rgba(255,255,255,.5)}
-.dropzone:hover,.dropzone.drag{border-color:var(--b2);background:rgba(219,234,254,.6);transform:translateY(-2px)}
-.dropzone .big{font-size:40px}
+.dropzone{border:2px dashed #c7d0de;border-radius:16px;padding:22px;text-align:center;cursor:pointer;
+transition:.2s;background:#f8fafc}
+.dropzone:hover,.dropzone.drag{border-color:var(--brand);background:#eef2ff;transform:translateY(-2px)}
+.dropzone .big{font-size:38px}
 .dropzone .t{font-weight:700;margin-top:6px}
 .dropzone .s{font-size:12px;color:var(--muted);margin-top:3px}
-.section-h{display:flex;align-items:center;gap:9px;font-weight:800;font-size:15px;margin:6px 0 12px}
-.section-h .dot{width:8px;height:8px;border-radius:50%;background:linear-gradient(135deg,var(--b1),var(--acc))}
-/* upload queue */
+.section-h{display:flex;align-items:center;gap:9px;font-weight:800;font-size:15px;margin:6px 0 12px;color:var(--ink)}
+.section-h .dot{width:8px;height:8px;border-radius:50%;background:linear-gradient(135deg,var(--brand),var(--acc))}
 #upQueue{margin-top:12px;display:flex;flex-direction:column;gap:9px}
-.uprow{background:rgba(255,255,255,.7);border:1px solid var(--line);border-radius:13px;padding:10px 12px}
+.uprow{background:#f8fafc;border:1px solid var(--line);border-radius:12px;padding:10px 12px}
 .uprow .nm{font-size:13px;font-weight:600;word-break:break-all;display:flex;justify-content:space-between;gap:8px}
-.uprow .pct{font-variant-numeric:tabular-nums;color:var(--b2);font-weight:700}
-.upbar{height:9px;background:#e9edf6;border-radius:6px;overflow:hidden;margin-top:7px}
-.upbar>i{display:block;height:100%;width:0;border-radius:6px;background:linear-gradient(90deg,var(--b1),var(--acc));transition:width .25s}
+.uprow .pct{font-variant-numeric:tabular-nums;color:var(--brand);font-weight:700}
+.upbar{height:8px;background:#e9edf6;border-radius:6px;overflow:hidden;margin-top:7px}
+.upbar>i{display:block;height:100%;width:0;border-radius:6px;background:linear-gradient(90deg,var(--brand),var(--acc));transition:width .25s}
 .uprow.done .upbar>i{background:linear-gradient(90deg,#22c55e,#16a34a)}
 .uprow.err .upbar>i{background:linear-gradient(90deg,#f59e0b,#ef4444)}
 .uprow .st{font-size:11px;color:var(--muted);margin-top:5px}
-/* remote row */
 .remote-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .remote-row input{flex:1;min-width:160px}
 .statusline{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--muted);min-height:20px}
-/* ===== breadcrumb ===== */
+/* breadcrumb */
 .crumb{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:14px;margin:16px 0 12px;
-background:var(--card);backdrop-filter:blur(12px);padding:11px 15px;border-radius:14px;
-border:1px solid rgba(255,255,255,.7);box-shadow:0 5px 18px rgba(15,23,42,.05)}
-.crumb a{color:var(--b2);cursor:pointer;text-decoration:none;font-weight:700}
+background:#fff;padding:11px 15px;border-radius:13px;border:1px solid var(--line)}
+.crumb a{color:var(--brand);cursor:pointer;text-decoration:none;font-weight:700}
 .crumb a:hover{text-decoration:underline}
 .crumb span.sep{color:#94a3b8}
-/* toolbar */
 .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 .toolbar .search{flex:1;min-width:160px;position:relative}
 .toolbar .search input{width:100%;padding-left:38px}
 .toolbar .search .si{position:absolute;left:13px;top:50%;transform:translateY(-50%);opacity:.5}
-/* ===== folders grid ===== */
+/* folders grid */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:12px;margin-bottom:18px}
-.fold{background:linear-gradient(135deg,#fff,#eef2ff);border:1px solid #e1e7f7;border-radius:16px;padding:15px;cursor:pointer;
+.fold{background:#fff;border:1px solid var(--line);border-radius:15px;padding:15px;cursor:pointer;
 display:flex;flex-direction:column;gap:5px;transition:.2s;position:relative;overflow:hidden}
-.fold:before{content:"";position:absolute;inset:0;background:linear-gradient(135deg,transparent,rgba(109,40,217,.06));opacity:0;transition:.2s}
-.fold:hover{transform:translateY(-3px);box-shadow:0 14px 30px rgba(37,99,235,.16);border-color:#c7d2fe}
-.fold:hover:before{opacity:1}
-.fold .ico{font-size:34px;filter:drop-shadow(0 4px 6px rgba(109,40,217,.25))}
+.fold:hover{transform:translateY(-3px);box-shadow:0 12px 26px rgba(79,70,229,.14);border-color:#c7d2fe}
+.fold .ico{font-size:32px}
 .fold .nm{font-weight:700;word-break:break-word;font-size:14px}
 .fold .ct{font-size:11px;color:var(--muted)}
 .fold .fbtns{position:absolute;top:8px;right:8px;display:none;gap:4px}
@@ -975,40 +1100,37 @@ display:flex;flex-direction:column;gap:5px;transition:.2s;position:relative;over
 .fold .fbtns button{border:0;border-radius:8px;width:28px;height:28px;font-size:12px;padding:0;box-shadow:none}
 .fold .fbtns .ren{background:#dbeafe;color:#1e40af}
 .fold .fbtns .del{background:#fee2e2;color:#b91c1c}
-/* ===== file rows ===== */
-.file{background:var(--card);backdrop-filter:blur(12px);border-radius:16px;padding:14px;margin-bottom:11px;
-box-shadow:0 5px 18px rgba(15,23,42,.06);border:1px solid rgba(255,255,255,.7);transition:.2s}
-.file:hover{box-shadow:0 14px 30px rgba(15,23,42,.1);transform:translateY(-1px)}
+/* file rows */
+.file{background:var(--card);border-radius:15px;padding:14px;margin-bottom:11px;
+box-shadow:0 2px 10px rgba(15,23,42,.04);border:1px solid var(--line);transition:.2s}
+.file:hover{box-shadow:0 10px 24px rgba(15,23,42,.08);transform:translateY(-1px)}
 .file .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
-.ficon{font-size:26px;flex-shrink:0;width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;
+.ficon{font-size:24px;flex-shrink:0;width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;
 background:linear-gradient(135deg,#eef2ff,#e0f2fe);cursor:pointer;transition:.18s}
 .ficon:hover{transform:scale(1.06)}
 .fname{font-weight:700;word-break:break-all;cursor:pointer;color:var(--ink);text-decoration:none;font-size:14.5px}
-.fname:hover{color:var(--b2);text-decoration:underline}
+.fname:hover{color:var(--brand);text-decoration:underline}
 .meta{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
 .acts button{font-size:12.5px;padding:7px 11px}
 .tag{display:inline-block;font-size:11px;padding:2px 9px;border-radius:10px;background:#dbeafe;color:#1e40af;margin-left:6px;font-weight:700}
 .tag.exp{background:#fee2e2;color:#991b1b}
 .tag.life{background:#dcfce7;color:#166534}
-/* pager */
 .pager{display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap;margin:18px 0 6px}
 .pager button{padding:8px 13px;min-width:40px}
 .pager .pinfo{font-size:13px;color:var(--muted);font-weight:600;padding:0 6px}
-/* toast */
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;
 padding:13px 22px;border-radius:13px;z-index:99;opacity:0;transition:.3s;font-size:14px;max-width:90%;
-box-shadow:0 12px 34px rgba(0,0,0,.45);pointer-events:none}
+box-shadow:0 12px 34px rgba(0,0,0,.4);pointer-events:none}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(-4px)}
-/* modal */
-.modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(6px);display:none;
+.modal{position:fixed;inset:0;background:rgba(15,23,42,.5);backdrop-filter:blur(5px);display:none;
 align-items:center;justify-content:center;z-index:50;padding:16px;animation:fadeIn .2s ease}
 .modal.show{display:flex}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
-.modal .box{background:#fff;border-radius:22px;padding:26px;max-width:430px;width:100%;
-box-shadow:0 30px 70px rgba(0,0,0,.45);animation:pop .25s cubic-bezier(.2,.9,.3,1.2);border:1px solid #eef0f5}
+.modal .box{background:#fff;border-radius:20px;padding:26px;max-width:430px;width:100%;
+box-shadow:0 30px 70px rgba(0,0,0,.4);animation:pop .25s cubic-bezier(.2,.9,.3,1.2);border:1px solid #eef0f5}
 @keyframes pop{from{opacity:0;transform:scale(.9) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
-.modal h3{margin:0 0 16px;font-size:19px;display:flex;align-items:center;gap:9px;font-weight:800}
+.modal h3{margin:0 0 16px;font-size:18px;display:flex;align-items:center;gap:9px;font-weight:800}
 .modal input,.modal select{width:100%;margin:6px 0}
 .modal .mico{width:56px;height:56px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:28px;margin:0 auto 12px}
 .modal .mico.ask{background:linear-gradient(135deg,#fef3c7,#fde68a)}
@@ -1016,7 +1138,7 @@ box-shadow:0 30px 70px rgba(0,0,0,.45);animation:pop .25s cubic-bezier(.2,.9,.3,
 .modal .mtext{text-align:center;color:#475569;font-size:14px;line-height:1.6;margin-bottom:18px;word-break:break-word}
 .modal .mbtns{display:flex;gap:10px}
 .modal .mbtns button{flex:1}
-.modal .pbox{background:#0f172a;border-radius:22px;padding:18px;max-width:880px;width:100%;
+.modal .pbox{background:#0f172a;border-radius:20px;padding:18px;max-width:880px;width:100%;
 box-shadow:0 30px 70px rgba(0,0,0,.6);animation:pop .25s cubic-bezier(.2,.9,.3,1.2);border:1px solid #1e293b;color:#fff}
 .modal .pbox .phead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
 .modal .pbox .ptitle{font-weight:700;font-size:15px;word-break:break-all}
@@ -1029,16 +1151,17 @@ border-radius:10px;width:36px;height:36px;padding:0;flex-shrink:0;box-shadow:non
 .modal .pbox .pna{padding:30px;text-align:center;color:#cbd5e1;font-size:14px}
 small{color:var(--muted)}
 .empty{text-align:center;color:var(--muted);padding:46px 0}
-.empty .big{font-size:48px}
-.spin{width:16px;height:16px;border:2.4px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;
+.empty .big{font-size:46px}
+.spin{width:16px;height:16px;border:2.4px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;
 animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;margin-right:6px}
-.spin.dark{border-color:rgba(109,40,217,.25);border-top-color:#6d28d9}
+.spin.dark{border-color:rgba(79,70,229,.25);border-top-color:#4f46e5}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style></head><body>
 <header>
-<div class="brand"><div class="lg">⚡</div><div><h1>Fast Lugyi Storage</h1>
-<div class="tagline">Secure Cloud Drive • R2 Premium</div></div></div>
+<div class="brand"><div class="lg">☁️</div><div><h1>Lugyi Cloud</h1>
+<div class="tagline">Secure Personal Drive</div></div></div>
 <div class="topbtns">
+<div class="userchip"><span class="av" id="avatar">U</span><span id="uname">...</span></div>
 <button class="ghost" onclick="openPass()">🔑 Password</button>
 <button class="ghost" onclick="logout()">🚪 ထွက်မည်</button>
 </div>
@@ -1061,18 +1184,18 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
     </div>
   </div>
   <div class="glass">
-    <div class="section-h"><span class="dot"></span>🔗 Remote URL ဖြင့်တင်ရန် <small>(1.5GB ထိ)</small></div>
+    <div class="section-h"><span class="dot"></span>🔗 Link မှ တင်ရန် <small>(1.5GB ထိ)</small></div>
     <div class="remote-row">
       <input type="text" id="remoteUrl" placeholder="https://...">
       <input type="text" id="remoteName" placeholder="ဖိုင်နာမည် (optional)">
     </div>
-    <button id="remoteBtn" onclick="uploadRemote()" style="width:100%;margin-top:10px">⬆ Remote တင်မည်</button>
+    <button id="remoteBtn" onclick="uploadRemote()" style="width:100%;margin-top:10px">⬆ Link မှ တင်မည်</button>
     <div class="statusline" id="remoteStatus"></div>
   </div>
 </div>
 
-<div class="glass" style="margin-bottom:16px">
-  <div class="section-h"><span class="dot"></span>📤 ဖုန်းထဲက ဖိုင်တင်ရန် <small>(တစ်ခါ အများဆုံး ၃ ဖိုင်)</small></div>
+<div class="glass" style="margin-bottom:18px">
+  <div class="section-h"><span class="dot"></span>📤 ဖိုင်တင်ရန် <small>(တစ်ခါ အများဆုံး ၃ ဖိုင်)</small></div>
   <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
     <div class="big">☁️</div>
     <div class="t">ဖိုင်ရွေးရန် နှိပ်ပါ (သို့) ဆွဲချပါ</div>
@@ -1098,14 +1221,12 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 
 </div>
 
-<!-- Preview modal -->
 <div class="modal" id="previewModal"><div class="pbox">
 <div class="phead"><div class="ptitle" id="previewTitle"></div>
 <button class="pclose" onclick="closePreview()">✖</button></div>
 <div class="pbody" id="previewBody"></div>
 </div></div>
 
-<!-- Share modal -->
 <div class="modal" id="shareModal"><div class="box">
 <h3>🔗 Share Link</h3>
 <select id="shareDur">
@@ -1118,7 +1239,6 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('shareModal')">ပိတ်မည်</button>
 </div></div>
 
-<!-- New folder modal -->
 <div class="modal" id="folderModal"><div class="box">
 <h3>📁 Folder အသစ်ဆောက်ရန်</h3>
 <input type="text" id="folderName" placeholder="Folder နာမည်" maxlength="80">
@@ -1127,7 +1247,6 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('folderModal')">ပိတ်မည်</button>
 </div></div>
 
-<!-- Rename modal -->
 <div class="modal" id="renameModal"><div class="box">
 <h3>✏️ နာမည်ပြောင်းရန်</h3>
 <input type="text" id="renameInput" placeholder="ဖိုင်နာမည် အသစ်" maxlength="200">
@@ -1136,7 +1255,6 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('renameModal')">ပိတ်မည်</button>
 </div></div>
 
-<!-- Move modal -->
 <div class="modal" id="moveModal"><div class="box">
 <h3>📦 ဖိုင်ရွှေ့ရန်</h3>
 <select id="moveTarget"></select>
@@ -1144,7 +1262,6 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('moveModal')">ပိတ်မည်</button>
 </div></div>
 
-<!-- Password modal -->
 <div class="modal" id="passModal"><div class="box">
 <h3>🔑 Password ပြောင်းရန်</h3>
 <input type="password" id="oldPass" placeholder="လက်ရှိ password">
@@ -1154,7 +1271,6 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <button class="sec" style="width:100%;margin-top:10px" onclick="closeModal('passModal')">ပိတ်မည်</button>
 </div></div>
 
-<!-- Confirm modal -->
 <div class="modal" id="confirmModal"><div class="box">
 <div class="mico" id="confirmIco">❓</div>
 <h3 id="confirmTitle" style="justify-content:center"></h3>
@@ -1169,7 +1285,7 @@ animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;ma
 <script>
 let currentFolder="",currentShareId=null,currentMoveId=null,currentRenameId=null;
 let allFolders=[],currentPage=1;const PAGE_SIZE=12;let lastFiles=[],_confirmCb=null;
-const MAX_PARALLEL=3;            // ✅ တစ်ခါ ၃ ဖိုင်
+const MAX_PARALLEL=3;
 const DIRECT_LIMIT=90*1024*1024;
 
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3000);}
@@ -1191,14 +1307,11 @@ function confirmBox({title,text,okText='အတည်ပြုမည်',danger=t
 }
 function confirmResolve(v){closeModal('confirmModal');if(_confirmCb){_confirmCb(v);_confirmCb=null;}}
 
-/* ===== Preview + MediaSession fix ===== */
 function clearMediaSession(){
-  // ✅ noti bar က video/audio metadata ပျောက်အောင် (refresh မလုပ်ဘဲ)
   try{
     if('mediaSession' in navigator){
       navigator.mediaSession.metadata=null;
       navigator.mediaSession.playbackState='none';
-      // action handler တွေ ဖယ်
       ['play','pause','seekto','seekforward','seekbackward','previoustrack','nexttrack','stop']
         .forEach(a=>{try{navigator.mediaSession.setActionHandler(a,null);}catch(e){}});
     }
@@ -1218,25 +1331,28 @@ function openPreview(id,name,type){
 }
 function closePreview(){
   const body=document.getElementById('previewBody');
-  // ✅ media ကို သေချာ ရပ်/ဖြုတ်ပြီးမှ ဖျက် — noti bar icon ချက်ချင်းပျောက်စေရန်
   const m=body.querySelector('video,audio');
   if(m){try{m.pause();m.removeAttribute('src');m.srcObject=null;m.load();}catch(e){}}
   body.innerHTML='';
-  clearMediaSession();        // ✅ refresh မလုပ်ဘဲ noti ပျောက်
+  clearMediaSession();
   closeModal('previewModal');
 }
-// video element တင်ပြီးတာနဲ့ mediaSession metadata ထည့်ပေး (close မှာ ပြန်ရှင်းမယ်)
 document.addEventListener('play',function(e){
   if(e.target&&(e.target.tagName==='VIDEO'||e.target.tagName==='AUDIO')&&'mediaSession' in navigator){
-    try{navigator.mediaSession.metadata=new MediaMetadata({title:document.getElementById('previewTitle').textContent||'Fast Lugyi Storage',artist:'Fast Lugyi Storage'});}catch(e){}
+    try{navigator.mediaSession.metadata=new MediaMetadata({title:document.getElementById('previewTitle').textContent||'Lugyi Cloud',artist:'Lugyi Cloud'});}catch(e){}
   }
 },true);
 
-/* ===== Routing ===== */
 function setRoute(folder,push){currentFolder=folder;currentPage=1;
   const url='#'+(folder?('f/'+folder):'');if(push)history.pushState({folder},'',url);load();}
 window.addEventListener('popstate',e=>{const f=(e.state&&e.state.folder!==undefined)?e.state.folder:parseHash();currentFolder=f||"";currentPage=1;load();});
 function parseHash(){const h=location.hash||'';const m=h.match(/^#f\\/(.+)$/);return m?decodeURIComponent(m[1]):"";}
+
+async function loadMe(){
+  try{const r=await fetch('/api/me');if(r.ok){const d=await r.json();
+    document.getElementById('uname').textContent=d.username;
+    document.getElementById('avatar').textContent=(d.username||'U').charAt(0).toUpperCase();}}catch(e){}
+}
 
 async function load(){
   const r=await fetch('/api/list?folder='+encodeURIComponent(currentFolder));
@@ -1316,7 +1432,6 @@ async function del(id,name){
   const d=await r.json();if(r.ok){toast('🗑 ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မဖျက်နိုင်ပါ');
 }
 
-/* ===== Rename ===== */
 function openRename(id,name){currentRenameId=id;document.getElementById('renameErr').textContent='';
   document.getElementById('renameInput').value=name;openModal('renameModal');
   setTimeout(()=>document.getElementById('renameInput').focus(),100);}
@@ -1329,7 +1444,6 @@ async function doRename(){
   else document.getElementById('renameErr').textContent=d.error||'မရပါ';
 }
 
-/* ===== Folder ops ===== */
 function openNewFolder(){document.getElementById('folderErr').textContent='';document.getElementById('folderName').value='';openModal('folderModal');}
 async function doCreateFolder(){
   const name=document.getElementById('folderName').value.trim();
@@ -1351,7 +1465,6 @@ async function delFolder(id,name){
   const d=await r.json();if(r.ok){toast('🗑 Folder ဖျက်ပြီးပါပြီ');load();}else toast(d.error||'မရပါ');
 }
 
-/* ===== Move ===== */
 async function openMove(id){currentMoveId=id;await buildAllFolders();
   const sel=document.getElementById('moveTarget');
   sel.innerHTML='<option value="">🏠 Home (root)</option>'+allFolders.map(f=>'<option value="'+f.id+'">📁 '+escapeHtml(f.path)+'</option>').join('');
@@ -1368,7 +1481,6 @@ async function doMove(){
   const d=await r.json();if(r.ok){toast('📦 ရွှေ့ပြီးပါပြီ');closeModal('moveModal');load();}else toast(d.error||'မရပါ');
 }
 
-/* ===== Upload (with % progress + 3-file limit) ===== */
 const dz=document.getElementById('dropzone');
 ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
 ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag');}));
@@ -1378,12 +1490,11 @@ document.getElementById('fileInput').addEventListener('change',e=>{const fs=[...
 function handleFiles(files){
   if(files.length>MAX_PARALLEL){toast('⚠️ တစ်ခါ အများဆုံး ၃ ဖိုင်သာ တင်နိုင်ပါသည်။ ပထမ ၃ ဖိုင်ကိုသာ တင်ပါမည်။');files=files.slice(0,MAX_PARALLEL);}
   const q=document.getElementById('upQueue');q.innerHTML='';
-  const rows=files.map((f,i)=>{
+  files.map((f,i)=>{
     const row=document.createElement('div');row.className='uprow';row.id='up'+i;
     row.innerHTML='<div class="nm"><span>'+escapeHtml(f.name)+'</span><span class="pct" id="pct'+i+'">0%</span></div>'+
       '<div class="upbar"><i id="bar'+i+'"></i></div><div class="st" id="st'+i+'">စောင့်ဆိုင်းနေသည်...</div>';
     q.appendChild(row);return row;});
-  // ✅ ၃ ဖိုင် တစ်ပြိုင်တည်း (parallel)
   Promise.all(files.map((f,i)=>uploadOne(f,i))).then(()=>{
     toast('✅ အားလုံး တင်ပြီးပါပြီ');setTimeout(()=>{document.getElementById('upQueue').innerHTML='';},2500);load();
   });
@@ -1393,7 +1504,6 @@ function setProg(i,pct,txt,cls){
   if(bar)bar.style.width=pct+'%';if(p)p.textContent=Math.round(pct)+'%';if(st&&txt)st.textContent=txt;
   if(cls&&row)row.classList.add(cls);
 }
-// XHR ဖြင့် upload progress % ရအောင်
 function xhrUpload(url,method,body,headers,onProg){
   return new Promise((resolve,reject)=>{
     const xhr=new XMLHttpRequest();xhr.open(method,url);
@@ -1417,8 +1527,8 @@ async function uploadOne(file,i){
       const pr=await fetch('/api/presign',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({name:file.name,size:file.size,type:file.type,folder:currentFolder})});
       const pd=await pr.json();if(!pr.ok)throw new Error(pd.error);
-      const res=await xhrUpload(pd.uploadUrl,'PUT',file,{'Content-Type':file.type||'application/octet-stream'},p=>setProg(i,p,'R2 သို့ တင်နေသည်...'));
-      if(!res.ok)throw new Error('R2 PUT failed '+res.status);
+      const res=await xhrUpload(pd.uploadUrl,'PUT',file,{'Content-Type':file.type||'application/octet-stream'},p=>setProg(i,p,'သိုလှောင်ခန့်သို့ တင်နေသည်...'));
+      if(!res.ok)throw new Error('Upload failed '+res.status);
       setProg(i,100,'အတည်ပြုနေသည်...');
       const fr=await fetch('/api/finalize',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({id:pd.id,key:pd.key,name:file.name,type:file.type,folder:currentFolder})});
@@ -1433,17 +1543,16 @@ async function uploadRemote(){
   const name=document.getElementById('remoteName').value.trim();
   if(!url){toast('URL ထည့်ပါ');return;}
   const st=document.getElementById('remoteStatus'),btn=document.getElementById('remoteBtn');
-  btn.disabled=true;st.innerHTML='<span class="spin dark"></span> Remote ဖိုင်တင်နေသည်... (ခဏစောင့်ပါ)';
+  btn.disabled=true;st.innerHTML='<span class="spin dark"></span> ဖိုင်တင်နေသည်... (ခဏစောင့်ပါ)';
   try{
     const r=await fetch('/api/remote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,name,folder:currentFolder})});
     const d=await r.json();
-    if(r.ok){toast('✅ Remote ဖိုင်တင်ပြီးပါပြီ');document.getElementById('remoteUrl').value='';document.getElementById('remoteName').value='';load();}
+    if(r.ok){toast('✅ ဖိုင်တင်ပြီးပါပြီ');document.getElementById('remoteUrl').value='';document.getElementById('remoteName').value='';load();}
     else toast('❌ '+(d.error||'မတင်နိုင်ပါ'));
   }catch(e){toast('❌ ကွန်ရက် ပြဿနာ');}
   st.innerHTML='';btn.disabled=false;
 }
 
-/* ===== Share / Pass ===== */
 function openShare(id){currentShareId=id;document.getElementById('shareResult').textContent='';openModal('shareModal');}
 async function doShare(){
   const dur=document.getElementById('shareDur').value;
@@ -1468,9 +1577,9 @@ async function doChangePass(){
 }
 async function logout(){await fetch('/api/logout',{method:'POST'});location.href='/login';}
 
-// init
 currentFolder=parseHash();
 history.replaceState({folder:currentFolder},'',location.hash||'#');
+loadMe();
 load();
 </script>
 </body></html>`;
